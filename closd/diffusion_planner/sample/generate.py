@@ -183,7 +183,7 @@ def main(args=None):
         if args.guidance_param != 1:
             model_kwargs['y']['scale'] = torch.ones(args.batch_size, device=dist_util.dev()) * args.guidance_param
         
-        if 'text' in model_kwargs['y'].keys():
+        if 'text' in model_kwargs['y'].keys() and getattr(model, 'text_encoder_type', 'clip') != 'none':
             # encoding once instead of each iteration saves lots of time
             model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
 

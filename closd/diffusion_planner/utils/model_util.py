@@ -49,6 +49,11 @@ def get_model_args(args, data):
         data_rep = 'hml_vec'
         njoints = 251
         nfeats = 1
+    elif args.dataset == 'aistpp':
+        data_rep = 'hml_vec'
+        njoints = 263
+        nfeats = 1
+        all_goal_joint_names = ['pelvis'] + HML_EE_JOINT_NAMES
 
     # Compatibility with old models
     if not hasattr(args, 'pred_len'):

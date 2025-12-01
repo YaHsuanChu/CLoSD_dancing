@@ -19,6 +19,10 @@ def get_dataset_class(name):
     elif name == "kit":
         from closd.diffusion_planner.data_loaders.humanml.data.dataset import KIT
         return KIT
+    elif name == "aistpp":
+        # New AIST++ audio->motion dataset wrapper
+        from closd.diffusion_planner.data_loaders.aistpp.data.dataset import AISTPP
+        return AISTPP
     else:
         raise ValueError(f'Unsupported dataset name [{name}]')
 
@@ -26,7 +30,7 @@ def get_collate_fn(name, hml_mode='train', pred_len=0, batch_size=1):
     if hml_mode == 'gt':
         from closd.diffusion_planner.data_loaders.humanml.data.dataset import collate_fn as t2m_eval_collate
         return t2m_eval_collate
-    if name in ["humanml", "kit"]:
+    if name in ["humanml", "kit", "aistpp"]:
         if pred_len > 0:
             return lambda x: t2m_prefix_collate(x, pred_len=pred_len)
         return lambda x: t2m_collate(x, batch_size)
@@ -37,7 +41,7 @@ def get_collate_fn(name, hml_mode='train', pred_len=0, batch_size=1):
 def get_dataset(name, num_frames, split='train', hml_mode='train', abs_path='.', fixed_len=0, hml_type=None, 
                 device=None, autoregressive=False, return_keys=False, cache_path=None): 
     DATA = get_dataset_class(name)
-    if name in ["humanml", "kit"]:
+    if name in ["humanml", "kit", "aistpp"]:
         dataset = DATA(split=split, num_frames=num_frames, mode=hml_mode, abs_path=abs_path, fixed_len=fixed_len, hml_type=hml_type, 
                        device=device, autoregressive=autoregressive, return_keys=return_keys, cache_path=cache_path)
     else:

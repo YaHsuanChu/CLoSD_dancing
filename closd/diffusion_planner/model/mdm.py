@@ -125,6 +125,10 @@ class MDM(nn.Module):
                     self.clip_model = load_bert(bert_model_path)
                     self.encode_text = self.bert_encode_text
                     self.clip_dim = 768
+                elif self.text_encoder_type == 'none':
+                    # Audio-conditioned path: use provided y['text_embed'] with dimension audio_feat_dim
+                    self.clip_dim = kargs.get('audio_feat_dim', 80)
+                    self.encode_text = lambda raw_text: None  # not used when y['text_embed'] is provided
                 else:
                     raise ValueError('We only support [CLIP, BERT] text encoders') 
                 
@@ -235,7 +239,8 @@ class MDM(nn.Module):
                 emb = text_emb + time_emb
             else:
                 emb = torch.cat([time_emb, text_emb], dim=0)
-                text_mask = torch.cat([torch.zeros_like(text_mask[:, 0:1]), text_mask], dim=1)
+                if 'text_embed' not in y.keys():
+                    text_mask = torch.cat([torch.zeros_like(text_mask[:, 0:1]), text_mask], dim=1)
         if 'action' in self.cond_mode:
             action_emb = self.embed_action(y['action'])
             emb += self.mask_cond(action_emb, force_mask=force_mask)
@@ -271,7 +276,7 @@ class MDM(nn.Module):
                 xseq = x
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
 
-            if self.text_encoder_type == 'clip':
+            if self.text_encoder_type == 'clip' or self.text_encoder_type == 'none':
                 output = self.seqTransDecoder(tgt=xseq, memory=emb, tgt_key_padding_mask=frames_mask)
             elif self.text_encoder_type == 'bert':
                 output = self.seqTransDecoder(tgt=xseq, memory=emb, memory_key_padding_mask=text_mask, tgt_key_padding_mask=frames_mask)  # Rotem's bug fix
