@@ -1,0 +1,33 @@
+# AIST++ dataset options for diffusion_planner (audio-conditioned)
+name=aistpp
+
+# Frame rate and lengths
+fps=20
+max_motion_frames=2877
+min_motion_frames=20
+
+# Skeleton/joints
+n_joints=22
+# Keep false when using preprocessed HumanML (263-d) motion features
+remap_joints=false
+dim_pose=263
+
+# Data locations (relative to closd/diffusion_planner)
+# Copy 263-d motion features into this folder
+motion_dir=data/aistpp/motions
+# Generate audio features (.npy) into this folder
+audio_dir=data/aistpp/audio_feats
+
+# Normalization stats (compute from the above dirs)
+motion_mean_path=dataset/aistpp_motion_mean_raw.npy
+motion_std_path=dataset/aistpp_motion_std_raw.npy
+audio_mean_path=dataset/aistpp_audio_mean.npy
+audio_std_path=dataset/aistpp_audio_std.npy
+
+# Collation
+# pool_audio=false -> mean-pool audio over time to a single vector
+pool_audio=false
+
+# Interpolation strategy if audio length != motion frames
+# options: none|linear|nearest
+audio_time_align=linear
