@@ -56,8 +56,16 @@ def collate(batch):
             audio_prefix_batch = [b['audio_emb_prefix'] for b in notnone_batches]
             cond['y'].update({'audio_embed_prefix': collate_tensors(audio_prefix_batch)})
         # Pool to text_embed from pred window for unified text-conditioning interface
+        # Determine the time axis by matching motion length T
         if audio_stack.dim() == 3:
-            pooled = audio_stack.mean(dim=1)
+            time_len = databatchTensor.shape[-1]
+            if audio_stack.shape[1] == time_len and audio_stack.shape[2] != time_len:
+                pooled = audio_stack.mean(dim=1)  # (B, F)
+            elif audio_stack.shape[2] == time_len and audio_stack.shape[1] != time_len:
+                pooled = audio_stack.mean(dim=2)  # (B, F)
+            else:
+                # Fallback: assume (B, T, F)
+                pooled = audio_stack.mean(dim=1)
         else:
             pooled = audio_stack
         cond['y'].update({'text_embed': pooled.unsqueeze(0)})
@@ -194,24 +202,16 @@ def t2m_prefix_collate(batch, pred_len):
                 if audio_np.ndim == 2:
                     # Orient audio to (T, F)
                     h, w = audio_np.shape
-                    audio_tw = audio_np if h >= w else audio_np.T
+                    audio_tw = audio_np.T
                     T = audio_tw.shape[0]
                     F = audio_tw.shape[1]
                     # Determine context_len from motion prefix length
                     context_len = item['prefix'].shape[-1]
-                    window_len = context_len + pred_len
                     if F >= 8 and F <= 4096:
-                        if T >= window_len:
-                            # Use the same trailing window as motion, then split
-                            window = audio_tw[-window_len:]
-                            audio_prefix = window[:context_len]
-                            audio_pred = window[-pred_len:]
-                        else:
-                            # Left-pad to reach window_len, then split
-                            pad = np.zeros((window_len - T, F), dtype=audio_tw.dtype)
-                            window = np.concatenate([pad, audio_tw], axis=0)
-                            audio_prefix = window[:context_len]
-                            audio_pred = window[-pred_len:]
+                        audio_prefix = audio_tw[:, :context_len]
+                        audio_pred = audio_tw[:, -pred_len:]
+                        # print(f'[DEBUG] Sliced audio into prefix {audio_prefix.shape} and pred {audio_pred.shape}, {audio_tw.shape}, {audio_np.shape}')
+                        
                         item['audio_emb_pred'] = torch.tensor(audio_pred.astype(np.float32))
                         item['audio_emb_prefix'] = torch.tensor(audio_prefix.astype(np.float32))
             except Exception:

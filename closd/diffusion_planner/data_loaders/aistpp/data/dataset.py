@@ -151,7 +151,11 @@ class AISTPPMotionAudioDataset(data.Dataset):
         dummy_pos = np.zeros((token_len, 1), dtype=np.float32)
         caption_placeholder = ''
         tokens_joined = '_'.join(audio_tokens)
-        return audio_embeddings, dummy_pos, caption_placeholder, token_len, motion, m_length, tokens_joined
+        ret = (audio_embeddings, dummy_pos, caption_placeholder, token_len, motion, m_length, tokens_joined)
+        # debug dimemsion checks print
+        # print(f'[DEBUG] Loaded idx={idx}: motion {motion.shape}, audio {audio_embeddings.shape}')
+        
+        return ret
 
 class AISTPP(data.Dataset):
     """Wrapper to mirror HumanML3D interface used by get_data factory."""
