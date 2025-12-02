@@ -237,7 +237,45 @@ class TrainLoop:
                 motion = motion.to(self.device)
                 cond['y'] = {key: val.to(self.device) if torch.is_tensor(val) else val for key, val in cond['y'].items()}
 
-                self.run_step(motion, cond)
+                # Optional: force unconditional text/audio conditioning for all batches.
+                # This leverages the existing MDM `text_uncond` flag, which will cause
+                # MDM.mask_cond(..., force_mask=True) to zero-out text/audio/action conds.
+                # Useful when using audio concat and you want a pure concat model
+                # without any cross-attention signal.
+                if getattr(self.args, 'text_uncond_all', False):
+                    cond['y']['text_uncond'] = True
+
+                # --- 若啟用 concat 模式，將 audio_emb 轉成 per-frame feature，與 motion 在 channel 維 concat ---
+                # motion: [B, D_motion, 1, T]
+                if getattr(self.args, 'audio_concat_mode', 'none') == 'concat':
+                    audio_emb = cond['y'].get('audio_emb', None)
+                    if audio_emb is not None:
+                        # Debug: 檢查實際的 shape
+                        print('[AIST++ concat debug] motion.shape =', tuple(motion.shape))
+                        print('[AIST++ concat debug] audio_emb.shape =', tuple(audio_emb.shape))
+                        print('[AIST++ concat debug] audio_emb.dim =', audio_emb.dim())
+
+                        # audio_emb 預期為 [B, T, F_audio]
+                        if audio_emb.dim() == 3:
+                            # -> [B, F_audio, 1, T]
+                            audio_feat = audio_emb.permute(0, 2, 1).unsqueeze(2)
+                        elif audio_emb.dim() == 4 and audio_emb.shape[1] != motion.shape[1]:
+                            # 已經是 [B, T, F_audio, ?] 之類的，就盡量對齊成 [B, F_audio, 1, T]
+                            audio_feat = audio_emb.permute(0, 3, 1, 2)
+                        else:
+                            # fallback：嘗試視為 [B, F_audio, 1, T]
+                            audio_feat = audio_emb
+
+                        print('[AIST++ concat debug] motion.shape (for cat) =', tuple(motion.shape))
+                        print('[AIST++ concat debug] audio_feat.shape (for cat) =', tuple(audio_feat.shape))
+
+                        x = torch.cat([motion, audio_feat], dim=1)
+                    else:
+                        x = motion
+                else:
+                    x = motion
+
+                self.run_step(x, cond)
                 if self.total_step() % self.log_interval == 0:
                     for k,v in logger.get_current().dumpkvs().items():
                         if k == 'loss':

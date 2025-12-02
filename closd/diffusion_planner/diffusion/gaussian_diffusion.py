@@ -1396,6 +1396,7 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
+            # 家块ごЧ俱 x_t[motion+audio] loss 度 motion channel 璸衡
             model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
@@ -1427,9 +1428,27 @@ class GaussianDiffusion:
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
-            assert model_output.shape == target.shape == x_start.shape  # [bs, njoints, nfeats, nframes]
 
-            terms["rot_mse"] = self.masked_l2(target, model_output, mask) # mean_flat(rot_mse)
+            # ㄌ dataset 崩﹚ motion  channel 计humanml/aistpp=263, kit=251
+            # 璝ゼ币ノ concat 家Α玥 motion_dim = 场 channel
+            motion_dim = x_start.shape[1]
+            audio_concat = False
+            if model_kwargs is not None and 'audio_emb' in model_kwargs.get('y', {}):
+                audio_concat = True
+
+            if audio_concat and dataset is not None and hasattr(dataset, 't2m_dataset'):
+                ds_name = getattr(dataset.t2m_dataset.opt, 'dataset_name', '')
+                if 'humanml' in ds_name or 'aist' in ds_name:
+                    motion_dim = min(263, x_start.shape[1])
+                elif 'kit' in ds_name:
+                    motion_dim = min(251, x_start.shape[1])
+
+            target_motion = target[:, :motion_dim, ...]
+            model_output_motion = model_output[:, :motion_dim, ...]
+
+            assert model_output_motion.shape == target_motion.shape  # [bs, D_motion, nfeats, nframes]
+
+            terms["rot_mse"] = self.masked_l2(target_motion, model_output_motion, mask) # mean_flat(rot_mse)
 
             if self.lambda_target_loc > 0.:
                 assert self.model_mean_type == ModelMeanType.START_X, 'This feature supports only X_start pred for now!'

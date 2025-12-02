@@ -41,6 +41,7 @@ def get_model_args(args, data):
     all_goal_joint_names = []
 
     if args.dataset == 'humanml':
+        # 純文字 T2M：263 維 motion
         data_rep = 'hml_vec'
         njoints = 263
         nfeats = 1
@@ -50,8 +51,14 @@ def get_model_args(args, data):
         njoints = 251
         nfeats = 1
     elif args.dataset == 'aistpp':
+        # AIST++：motion 263 維，可選擇是否 concat audio 成為額外通道
         data_rep = 'hml_vec'
-        njoints = 263
+        motion_dim = 263
+        if getattr(args, 'audio_concat_mode', 'none') == 'concat':
+            audio_dim = getattr(args, 'audio_dim', 0)
+            njoints = motion_dim + audio_dim
+        else:
+            njoints = motion_dim
         nfeats = 1
         all_goal_joint_names = ['pelvis'] + HML_EE_JOINT_NAMES
 
@@ -65,6 +72,8 @@ def get_model_args(args, data):
     multi_encoder_type = args.__dict__.get('multi_encoder_type', 'multi')
     target_enc_layers = args.__dict__.get('target_enc_layers', 1)
 
+    audio_concat_mode = args.__dict__.get('audio_concat_mode', 'none')
+
     return {'modeltype': '', 'njoints': njoints, 'nfeats': nfeats, 'num_actions': num_actions,
             'translation': True, 'pose_rep': 'rot6d', 'glob': True, 'glob_rot': True,
             'latent_dim': args.latent_dim, 'ff_size': 1024, 'num_layers': args.layers, 'num_heads': 4,
@@ -76,6 +85,7 @@ def get_model_args(args, data):
             'keyframe_cond_type': args.keyframe_cond_type,
             'pred_len': args.pred_len, 'context_len': args.context_len, 'emb_policy': emb_policy,
             'all_goal_joint_names': all_goal_joint_names, 'multi_target_cond': multi_target_cond, 'multi_encoder_type': multi_encoder_type, 'target_enc_layers': target_enc_layers,
+            'audio_concat_mode': audio_concat_mode,
             }
 
 

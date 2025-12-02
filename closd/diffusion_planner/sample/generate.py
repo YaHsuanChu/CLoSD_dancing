@@ -201,6 +201,18 @@ def main(args=None):
             recon_guidance=args.use_recon_guidance,
             cond_fn=cond_fn,
         )
+
+        # 若啟用 concat 模式且 channel 數大於純 motion joints，先切掉 audio channel
+        if getattr(args, 'audio_concat_mode', 'none') == 'concat':
+            if args.dataset in ['humanml', 'aistpp']:
+                motion_dim = 263
+            elif args.dataset == 'kit':
+                motion_dim = 251
+            else:
+                motion_dim = sample.shape[1]
+
+            if sample.shape[1] > motion_dim:
+                sample = sample[:, :motion_dim, ...]
         
 
         if args.multi_target_cond:

@@ -127,6 +127,8 @@ def add_model_options(parser):
                        help="Pose embedding max length.")
     group.add_argument("--use_ema", action='store_true',
                     help="If True, will use EMA model averaging.")
+    group.add_argument("--text_uncond_all", action='store_true',
+                       help="If True, will set y['text_uncond']=True for all training batches (useful for pure concat audio without cross-attention).")
     
     # Deprecated - old conditioning method on single joint - aka Guy's method:
     # group.add_argument("--target_cond", default=None,
@@ -137,6 +139,12 @@ def add_model_options(parser):
     group.add_argument("--multi_target_cond", action='store_true', help="If true, enable multi-target conditioning (aka Sigal's model).")
     group.add_argument("--multi_encoder_type", default='single', choices=['single', 'multi', 'split'], type=str, help="Specifies the encoder type to be used for the multi joint condition.")
     group.add_argument("--target_enc_layers", default=1, type=int, help="Num target encoder layers")
+
+    # Audio-related options
+    group.add_argument("--audio_dim", default=80, type=int,
+                       help="Per-frame audio feature dimension when using concat mode (e.g., AIST++ audio_feats).")
+    group.add_argument("--audio_concat_mode", default='none', choices=['none', 'concat'], type=str,
+                       help="If 'concat', will concatenate per-frame audio features to motion along the channel dimension.")
 
 
     # Prefix completion model
@@ -161,7 +169,7 @@ def add_data_options(parser):
     group.add_argument("--dataset", default='humanml', choices=['humanml', 'kit', 'humanact12', 'uestc', 'aistpp'], type=str,
                        help="Dataset name (choose from list).")
     group.add_argument("--audio_feat_dim", default=80, type=int,
-                       help="Audio feature dimension when using text_encoder_type none (AIST++).")
+                       help="Raw audio feature dimension (e.g., AIST++ audio_feats). For concat mode, usually equals audio_dim.")
     group.add_argument("--data_dir", default="", type=str,
                        help="If empty, will use defaults according to the specified dataset.")
     group.add_argument("--hml_type", default=None, type=str, choices=[None, 'global_root'],
