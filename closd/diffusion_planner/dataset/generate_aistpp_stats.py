@@ -217,6 +217,11 @@ def main():
     args = parser.parse_args()
 
     # Resolve motion/audio directories either from explicit overrides, edge_aistpp root, or split dirs
+    # First determine if we plan to skip motion entirely (audio-only stats)
+    skip_motion = False
+    if args.audio_dir is not None and args.motion_dir is None and args.edge_aistpp_root is None and (args.edge_root is None or args.edge_root == ''):
+        skip_motion = True
+
     if args.motion_dir is not None:
         motion_dirs = [args.motion_dir]
         audio_dirs = []
@@ -237,7 +242,7 @@ def main():
         wav_dir = os.path.join(args.edge_aistpp_root, "wavs")
         has_wavs_only = os.path.isdir(wav_dir) and not audio_dirs
         wav_dirs = [wav_dir] if os.path.isdir(wav_dir) else []
-    else:
+    elif not skip_motion:
         # Use split dirs produced by EDGE preprocessing
         train_motion_dir = os.path.join(args.edge_root, "train", "motions_sliced")
         test_motion_dir = os.path.join(args.edge_root, "test", "motions_sliced")
@@ -247,19 +252,60 @@ def main():
         test_audio_dir = os.path.join(args.edge_root, "test", args.audio_type)
         audio_dirs = [train_audio_dir, test_audio_dir]
         has_wavs_only = False
+    else:
+        # skip_motion case: we won't compute motion stats, and audio_dirs will be set below
+        motion_dirs = []
+        audio_dirs = []
+        has_wavs_only = False
 
     if args.audio_dir is not None:
         audio_dirs = [args.audio_dir]
 
     motion_stats = {}
-    if args.both:
-        motion_stats['raw'] = compute_motion_stats(motion_dirs, representation='raw')
-        try:
-            if args.edge_aistpp_root:
-                # Compute humanml by reconstructing joints from SMPL if needed
+    if not skip_motion:
+        if args.both:
+            motion_stats['raw'] = compute_motion_stats(motion_dirs, representation='raw')
+            try:
+                if args.edge_aistpp_root:
+                    if args.smpl_model_dir is None:
+                        raise RuntimeError("--smpl_model_dir is required to compute HumanML from edge_aistpp .pkl")
+                    sums = None; sumsq = None; count = 0
+                    sample_dir = motion_dirs[0]
+                    files = [f for f in os.listdir(sample_dir) if f.endswith('.pkl') or f.endswith('.npy')]
+                    files.sort()
+                    if not files:
+                        raise RuntimeError("No motion files found under edge_aistpp/motions")
+                    for name in files:
+                        fp = os.path.join(sample_dir, name)
+                        if fp.endswith('.pkl'):
+                            with open(fp, 'rb') as f:
+                                obj = pickle.load(f)
+                            joints = smpl_pkl_to_joints(obj, args.smpl_model_dir)  # [T, J, 3]
+                            raw_flat = joints.reshape(joints.shape[0], -1).astype(np.float32)
+                        else:
+                            arr = np.load(fp, allow_pickle=True)
+                            raw_flat = arr.reshape(arr.shape[0], -1).astype(np.float32)
+                        m = convert_motion_humanml(raw_flat)  # (T-1, 263)
+                        if sums is None:
+                            sums = np.zeros(m.shape[1], dtype=np.float64)
+                            sumsq = np.zeros(m.shape[1], dtype=np.float64)
+                        sums += m.sum(axis=0)
+                        sumsq += (m ** 2).sum(axis=0)
+                        count += m.shape[0]
+                    if count == 0:
+                        raise RuntimeError("No frames aggregated for HumanML stats")
+                    mean = (sums / count).astype(np.float32)
+                    var = (sumsq / count) - (mean.astype(np.float64) ** 2)
+                    std = np.sqrt(np.maximum(var, 1e-8)).astype(np.float32)
+                    motion_stats['humanml'] = (mean, std)
+                else:
+                    motion_stats['humanml'] = compute_motion_stats(motion_dirs, representation='humanml')
+            except Exception as e:
+                print(f"[WARN] HumanML stats skipped: {e}")
+        else:
+            if args.representation == 'humanml' and args.edge_aistpp_root:
                 if args.smpl_model_dir is None:
                     raise RuntimeError("--smpl_model_dir is required to compute HumanML from edge_aistpp .pkl")
-                # Build a temporary motion dir list of reconstructed joints in-memory
                 sums = None; sumsq = None; count = 0
                 sample_dir = motion_dirs[0]
                 files = [f for f in os.listdir(sample_dir) if f.endswith('.pkl') or f.endswith('.npy')]
@@ -290,45 +336,7 @@ def main():
                 std = np.sqrt(np.maximum(var, 1e-8)).astype(np.float32)
                 motion_stats['humanml'] = (mean, std)
             else:
-                motion_stats['humanml'] = compute_motion_stats(motion_dirs, representation='humanml')
-        except Exception as e:
-            print(f"[WARN] HumanML stats skipped: {e}")
-    else:
-        if args.representation == 'humanml' and args.edge_aistpp_root:
-            if args.smpl_model_dir is None:
-                raise RuntimeError("--smpl_model_dir is required to compute HumanML from edge_aistpp .pkl")
-            # Reuse reconstruction loop
-            sums = None; sumsq = None; count = 0
-            sample_dir = motion_dirs[0]
-            files = [f for f in os.listdir(sample_dir) if f.endswith('.pkl') or f.endswith('.npy')]
-            files.sort()
-            if not files:
-                raise RuntimeError("No motion files found under edge_aistpp/motions")
-            for name in files:
-                fp = os.path.join(sample_dir, name)
-                if fp.endswith('.pkl'):
-                    with open(fp, 'rb') as f:
-                        obj = pickle.load(f)
-                    joints = smpl_pkl_to_joints(obj, args.smpl_model_dir)  # [T, J, 3]
-                    raw_flat = joints.reshape(joints.shape[0], -1).astype(np.float32)
-                else:
-                    arr = np.load(fp, allow_pickle=True)
-                    raw_flat = arr.reshape(arr.shape[0], -1).astype(np.float32)
-                m = convert_motion_humanml(raw_flat)  # (T-1, 263)
-                if sums is None:
-                    sums = np.zeros(m.shape[1], dtype=np.float64)
-                    sumsq = np.zeros(m.shape[1], dtype=np.float64)
-                sums += m.sum(axis=0)
-                sumsq += (m ** 2).sum(axis=0)
-                count += m.shape[0]
-            if count == 0:
-                raise RuntimeError("No frames aggregated for HumanML stats")
-            mean = (sums / count).astype(np.float32)
-            var = (sumsq / count) - (mean.astype(np.float64) ** 2)
-            std = np.sqrt(np.maximum(var, 1e-8)).astype(np.float32)
-            motion_stats['humanml'] = (mean, std)
-        else:
-            motion_stats[args.representation] = compute_motion_stats(motion_dirs, representation=args.representation)
+                motion_stats[args.representation] = compute_motion_stats(motion_dirs, representation=args.representation)
 
     if audio_dirs:
         audio_mean, audio_std = compute_audio_stats(audio_dirs)

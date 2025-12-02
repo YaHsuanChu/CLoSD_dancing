@@ -245,25 +245,25 @@ class TrainLoop:
                 if getattr(self.args, 'text_uncond_all', False):
                     cond['y']['text_uncond'] = True
 
-                # --- ­Y±Ò¥Î concat ¼Ò¦¡¡A±N audio_emb Âà¦¨ per-frame feature¡A»P motion ¦b channel ºû concat ---
+                # --- è‹¥å•Ÿç”¨ concat æ¨¡å¼ï¼Œå°‡ audio_emb è½‰æˆ per-frame featureï¼Œèˆ‡ motion åœ¨ channel ç¶­ concat ---
                 # motion: [B, D_motion, 1, T]
                 if getattr(self.args, 'audio_concat_mode', 'none') == 'concat':
                     audio_emb = cond['y'].get('audio_emb', None)
                     if audio_emb is not None:
-                        # Debug: ÀË¬d¹ê»Úªº shape
+                        # Debug: æª¢æŸ¥å¯¦éš›çš„ shape
                         print('[AIST++ concat debug] motion.shape =', tuple(motion.shape))
                         print('[AIST++ concat debug] audio_emb.shape =', tuple(audio_emb.shape))
                         print('[AIST++ concat debug] audio_emb.dim =', audio_emb.dim())
 
-                        # audio_emb ¹w´Á¬° [B, T, F_audio]
+                        # audio_emb é æœŸç‚º [B, T, F_audio]
                         if audio_emb.dim() == 3:
                             # -> [B, F_audio, 1, T]
                             audio_feat = audio_emb.permute(0, 2, 1).unsqueeze(2)
                         elif audio_emb.dim() == 4 and audio_emb.shape[1] != motion.shape[1]:
-                            # ¤w¸g¬O [B, T, F_audio, ?] ¤§Ãşªº¡A´NºÉ¶q¹ï»ô¦¨ [B, F_audio, 1, T]
+                            # å·²ç¶“æ˜¯ [B, T, F_audio, ?] ä¹‹é¡çš„ï¼Œå°±ç›¡é‡å°é½Šæˆ [B, F_audio, 1, T]
                             audio_feat = audio_emb.permute(0, 3, 1, 2)
                         else:
-                            # fallback¡G¹Á¸Õµø¬° [B, F_audio, 1, T]
+                            # fallbackï¼šå˜—è©¦è¦–ç‚º [B, F_audio, 1, T]
                             audio_feat = audio_emb
 
                         print('[AIST++ concat debug] motion.shape (for cat) =', tuple(motion.shape))

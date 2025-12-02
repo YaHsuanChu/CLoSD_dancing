@@ -53,42 +53,43 @@ Field meanings:
 - `motion_len`: original (pre-padding/cropping) motion length in frames.
 - `audio_tokens_joined`: joined token string e.g. `a0_a1_...`; used downstream as a surrogate tokens field.
 
-Collated batch (after `t2m_collate` in `data_loaders/tensors.py`) produces:
+Collated batch (after `t2m_collate` / `t2m_prefix_collate` in `data_loaders/tensors.py`) produces:
 
 ```
-motion:  torch.Size([B, D_motion, 1, T_fixed])
+motion:  torch.Size([B, D_motion, 1, pred_len])
 cond['y'] keys:
-   mask:       (B, 1, 1, T_fixed) boolean broadcast mask
-   lengths:    (B,) original (or fixed_len) frame counts
-   text:       list[str] (empty strings here)
-   tokens:     list[str] token strings (audio token codes)
-   audio_emb:  (B, N_audio_tokens, F_audio)
-   text_embed: (N_audio_tokens, B, F_audio) transposed view for modules expecting text embeddings
-   db_key:     list (None placeholders unless return_keys enabled)
+   mask:               (B, 1, 1, pred_len) boolean broadcast mask
+   lengths:            (B,) original (or fixed_len) frame counts
+   text:               list[str] (empty strings here)
+   tokens:             list[str] token strings (audio token codes)
+   prefix:             (B, D_motion, 1, context_len)  
+   audio_embed_prefix: (B, context_len, F_audio)      
+   audio_embed_pred:   (B, pred_len,    F_audio)      
+   text_embed:         (1, B, F_audio)                # pooled global audio vector from pred window
+   db_key:             list (None placeholders unless return_keys enabled)
 ```
 
 Shape examples (current behavior):
-- `fixed_len=196`, `batch_size=2` → `motion (2,263,1,196)`, `audio_emb (2,196,80)`, `text_embed (1,2,80)`
-- `fixed_len=120`, `batch_size=2` → `motion (2,263,1,120)`, `audio_emb (2,120,80)`, `text_embed (1,2,80)`
-- `fixed_len=100`, `batch_size=2` → `motion (2,263,1,100)`, `audio_emb (2,100,80)`, `text_embed (1,2,80)`
+- Prefix mode: `context_len=20`, `pred_len=40`, `batch_size=64` → `motion prefix (64,263,1,20)`, `motion inp (64,263,1,40)`, `audio_embed_prefix (64,20,60)`, `audio_embed_pred (64,40,60)`, `text_embed (1,64,60)`
 
 Important dimensional conventions:
-- Motion ordering after collate is `(batch, D_motion, 1, T_frames)` rather than `(batch, 1, D_motion, T)`; the singleton second dimension is retained for historical compatibility with other data reps.
+- Motion ordering after collate is `(batch, D_motion, 1, pred_len)` rather than `(batch, 1, D_motion, pred_len)`; the singleton second dimension is retained for historical compatibility with other data reps.
 - Audio features use `(token, feature)` ordering before collate and become `(batch, N_audio_tokens, F_audio)` after collate.
-- If `pool_audio=false`, `N_audio_tokens` equals time-aligned motion length (or `fixed_len`) and `audio_emb` expands accordingly.
+- In prefix mode, audio is split into two windows: `audio_embed_prefix (context_len)` and `audio_embed_pred (pred_len)`. In non-prefix mode, only `audio_embed_pred` is provided and spans the full `T_fixed`.
 
 Access Patterns:
 ```python
 from closd.diffusion_planner.data_loaders.get_data import get_dataset_loader
 from closd.diffusion_planner.utils import dist_util
-loader = get_dataset_loader(name='aistpp', batch_size=4, num_frames=None, split='train',
-                                          hml_mode='train', fixed_len=196, pred_len=0,
-                                          abs_path='CLoSD_dancing/closd/diffusion_planner', device=dist_util.dev())
+
+loader = get_dataset_loader(name='aistpp', batch_size=64, num_frames=None, split='train',
+                            hml_mode='train', fixed_len=None, pred_len=40, context_len=20,
+                            abs_path='CLoSD_dancing/closd/diffusion_planner', device=dist_util.dev())
 motion, cond = next(iter(loader))
-audio_emb = cond['y']['audio_emb']      # (B, N_audio_tokens, F_audio)
-motion_tensor = motion                  # (B, D_motion, 1, T_frames)
-mask = cond['y']['mask']                # (B, 1, 1, T_frames)
-lengths = cond['y']['lengths']          # (B,)
+audio_prefix = cond['y']['audio_embed_prefix']  # (B, context_len, F_audio)
+audio_pred   = cond['y']['audio_embed_pred']    # (B, pred_len,    F_audio)
+text_embed   = cond['y']['text_embed']          # (1, B, F_audio)
+motion_prefix = cond['y']['prefix']             # (B, D_motion, 1, context_len)
 ```
 
 
@@ -98,20 +99,20 @@ lengths = cond['y']['lengths']          # (B,)
 
 ### 1. 資料流回顧
 
-- `motion`: 經過 collate 後為 `motion: (B, D_motion, 1, T_fixed)`，AIST++ / HumanML 目前 `D_motion=263`。
-- `audio_emb`: `cond['y']['audio_emb']: (B, N_audio_tokens, F_audio)`，在不 pool 的設定下 `N_audio_tokens=T_fixed`，每一幀一個 audio token。
+- `motion`: 經過 collate 後為 `motion: (B, D_motion, 1, pred_len)`，AIST++ / HumanML 目前 `D_motion=263`。
+- `audio_emb`: `cond['y']['audio_emb_pred']: (B, N_audio_tokens, F_audio)`，在不 pool 的設定下 `N_audio_tokens=pred_len`，每一幀一個 audio token。
 - `text_embed`: `cond['y']['text_embed']: (N_tokens, B, F_audio)`，目前會把 `audio_emb` 在時間維度做平均，得到一個 global audio token（`N_tokens=1`），提供給 MDM 原本的 text-conditioning 介面使用。
 
 訓練與推論時，`training_loop` 會依照 `audio_concat_mode` 決定是否把 `audio_emb` concat 進輸入 $x$：
 
 - 當 `audio_concat_mode='concat'` 時：
-   - `audio_emb (B, T, F)` 會被轉成 `(B, F_audio, 1, T_fixed)`，並在 channel 維度與 `motion` concat：
+   - `audio_embed_pred (B, T, F)` 會被轉成 `(B, F_audio, 1, T)`，並在 channel 維度與 `motion` concat：
       - `x = concat(motion, audio_feat)  # [B, D_motion + F_audio, 1, T]`
    - DiP/MDM 的 `njoints` 也會依據 `audio_dim` 自動變成 `263 + audio_dim`（只在 AIST++ 下生效）。
 - 當 `audio_concat_mode='none'`（預設）時：
    - `x = motion`，模型和原本 HumanML / DiP 行為相同，不會在輸入上看到 audio channel。
 
-在 diffusion loss 裡（`gaussian_diffusion.training_losses`），若偵測到有 `model_kwargs['y']['audio_emb']`（即 AIST++ concat 模式），會只對前 `D_motion` 個 channel（263）計算 reconstruction loss，視 concat 上去的 audio channel 為「附帶 feature、不強迫重建」。
+在 diffusion loss 裡（`gaussian_diffusion.training_losses`），若偵測到有 `model_kwargs['y']['audio_embed_pred']`（即 AIST++ concat 模式），會只對前 `D_motion` 個 channel（263）計算 reconstruction loss，視 concat 上去的 audio channel 為「附帶 feature、不強迫重建」。
 
 在 sampling 時（`sample/generate.py`），若 `audio_concat_mode='concat'` 且通道數大於 motion 維度，會先砍掉後面的 audio channel，再進行 `inv_transform` / `recover_from_ric` 等後處理，保證輸出仍然是純 motion：
 
