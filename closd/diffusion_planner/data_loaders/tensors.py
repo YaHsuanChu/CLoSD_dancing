@@ -44,19 +44,22 @@ def collate(batch):
         textbatch = [b['tokens'] for b in notnone_batches]
         cond['y'].update({'tokens': textbatch})
 
-    # attach audio embeddings if present (for AISTPP)
-    if 'audio_emb' in notnone_batches[0]:
-        audio_batch = [b['audio_emb'] for b in notnone_batches]
-        # Keep audio_emb time-aligned per-frame for conditioning over time
+    # attach audio embeddings if present (per-frame features)
+    # For non-prefix collate, treat entire audio as prediction window
+    if 'audio_emb_pred' in notnone_batches[0] or 'audio_emb' in notnone_batches[0]:
+        key_present = 'audio_emb_pred' if 'audio_emb_pred' in notnone_batches[0] else 'audio_emb'
+        audio_batch = [b[key_present] for b in notnone_batches]
         audio_stack = collate_tensors(audio_batch)  # (bs, seq, feat) or (bs, 1, feat)
-        cond['y'].update({'audio_emb': audio_stack})
-        # Force text_embed to be pooled (global) version for unified text-conditioning interface
-        # Pool across the sequence dimension to get (bs, feat)
+        cond['y'].update({'audio_embed_pred': audio_stack})
+        # Optional: include prefix key when provided in items
+        if 'audio_emb_prefix' in notnone_batches[0]:
+            audio_prefix_batch = [b['audio_emb_prefix'] for b in notnone_batches]
+            cond['y'].update({'audio_embed_prefix': collate_tensors(audio_prefix_batch)})
+        # Pool to text_embed from pred window for unified text-conditioning interface
         if audio_stack.dim() == 3:
-            pooled = audio_stack.mean(dim=1)  # (bs, feat)
+            pooled = audio_stack.mean(dim=1)
         else:
-            pooled = audio_stack  # (bs, feat) if already (bs, feat)
-        # Convert to tokens-first layout with a single token: (1, bs, feat)
+            pooled = audio_stack
         cond['y'].update({'text_embed': pooled.unsqueeze(0)})
 
     if 'action' in notnone_batches[0]:
@@ -93,13 +96,60 @@ def t2m_collate(batch, target_batch_size):
             'tokens': b[6] if len(b) > 6 else None,
             'key': b[7] if len(b) > 7 else None,
         }
-        # Optional text for HumanML
-        if isinstance(b[2], str):
-            item['text'] = b[2]
-        # Attach audio embeddings if first element looks like features
+        # Decide dataset tuple type by inspecting caption and pos shape
+        caption = b[2]
+        pos = b[1]
+        is_humanml = isinstance(caption, str) and caption != ''
+        is_aistpp = (not is_humanml) and (isinstance(pos, (np.ndarray, list)) and np.array(pos).ndim == 2 and np.array(pos).shape[1] == 1)
+
+        if is_humanml:
+            item['text'] = caption
+            # Preserve word embeddings & positional one-hots
+            if b[0] is not None and isinstance(b[0], (np.ndarray, list)):
+                try:
+                    we = np.array(b[0], dtype=np.float32)
+                    item['word_emb'] = torch.tensor(we)
+                except Exception:
+                    pass
+            if pos is not None and isinstance(pos, (np.ndarray, list)):
+                try:
+                    po = np.array(pos, dtype=np.float32)
+                    item['pos_ohot'] = torch.tensor(po)
+                except Exception:
+                    pass
+        elif is_aistpp:
+            # Treat first element as per-frame audio features; orient to (T,F)
+            try:
+                audio_np = np.array(b[0])
+                if audio_np.ndim == 2:
+                    T_motion = b[5]
+                    h, w = audio_np.shape
+                    if h == T_motion:
+                        audio_tw = audio_np
+                    elif w == T_motion:
+                        audio_tw = audio_np.T
+                    else:
+                        audio_tw = None
+                    if audio_tw is not None:
+                        item['audio_emb_pred'] = torch.tensor(audio_tw.astype(np.float32))
+            except Exception:
+                pass
+        # Attach audio embeddings only if it looks like per-frame features aligned to motion length
         try:
-            audio_np = np.array(b[0], dtype=np.float32)
-            item['audio_emb'] = torch.tensor(audio_np)
+            audio_np = np.array(b[0])
+            if audio_np.ndim == 2 and ('text' not in item):
+                T_motion = b[5]
+                h, w = audio_np.shape
+                if h == T_motion:
+                    T, F = h, w
+                    audio_tw = audio_np
+                elif w == T_motion:
+                    T, F = w, h
+                    audio_tw = audio_np.T
+                else:
+                    audio_tw = None
+                if audio_tw is not None and F >= 8 and F <= 2048:
+                    item['audio_emb_pred'] = torch.tensor(audio_tw.astype(np.float32))
         except Exception:
             pass
         adapted_batch.append(item)
@@ -118,13 +168,54 @@ def t2m_prefix_collate(batch, pred_len):
             'lengths': pred_len,
             'key': b[7] if len(b) > 7 else None,
         }
-        if isinstance(b[2], str):
-            item['text'] = b[2]
-        try:
-            audio_np = np.array(b[0], dtype=np.float32)
-            item['audio_emb'] = torch.tensor(audio_np)
-        except Exception:
-            pass
+        caption = b[2]
+        pos = b[1]
+        is_humanml = isinstance(caption, str) and caption != ''
+        is_aistpp = (not is_humanml) and (isinstance(pos, (np.ndarray, list)) and np.array(pos).ndim == 2 and np.array(pos).shape[1] == 1)
+
+        if is_humanml:
+            item['text'] = caption
+            if b[0] is not None and isinstance(b[0], (np.ndarray, list)):
+                try:
+                    we = np.array(b[0], dtype=np.float32)
+                    item['word_emb'] = torch.tensor(we)
+                except Exception:
+                    pass
+            if pos is not None and isinstance(pos, (np.ndarray, list)):
+                try:
+                    po = np.array(pos, dtype=np.float32)
+                    item['pos_ohot'] = torch.tensor(po)
+                except Exception:
+                    pass
+        elif is_aistpp:
+            # Slice audio into prefix and prediction windows aligned with motion split
+            try:
+                audio_np = np.array(b[0])
+                if audio_np.ndim == 2:
+                    # Orient audio to (T, F)
+                    h, w = audio_np.shape
+                    audio_tw = audio_np if h >= w else audio_np.T
+                    T = audio_tw.shape[0]
+                    F = audio_tw.shape[1]
+                    # Determine context_len from motion prefix length
+                    context_len = item['prefix'].shape[-1]
+                    window_len = context_len + pred_len
+                    if F >= 8 and F <= 4096:
+                        if T >= window_len:
+                            # Use the same trailing window as motion, then split
+                            window = audio_tw[-window_len:]
+                            audio_prefix = window[:context_len]
+                            audio_pred = window[-pred_len:]
+                        else:
+                            # Left-pad to reach window_len, then split
+                            pad = np.zeros((window_len - T, F), dtype=audio_tw.dtype)
+                            window = np.concatenate([pad, audio_tw], axis=0)
+                            audio_prefix = window[:context_len]
+                            audio_pred = window[-pred_len:]
+                        item['audio_emb_pred'] = torch.tensor(audio_pred.astype(np.float32))
+                        item['audio_emb_prefix'] = torch.tensor(audio_prefix.astype(np.float32))
+            except Exception:
+                pass
         adapted_batch.append(item)
     return collate(adapted_batch)
 

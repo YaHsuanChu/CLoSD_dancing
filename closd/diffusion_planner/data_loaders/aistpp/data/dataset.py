@@ -83,22 +83,8 @@ class AISTPPMotionAudioDataset(data.Dataset):
             return a.T.astype(np.float32)
 
     def _time_align_audio(self, audio, target_T):
-        # audio: (F, T_a)
-        F, Ta = audio.shape
-        if Ta == target_T or self.opt.pool_audio:
-            return audio
-        if self.opt.audio_time_align == 'linear':
-            xs = np.linspace(0, Ta - 1, target_T)
-            # interpolate each feature separately
-            aligned = np.stack([
-                np.interp(xs, np.arange(Ta), audio[f]) for f in range(F)
-            ], axis=0)
-            return aligned
-        elif self.opt.audio_time_align == 'nearest':
-            xs = np.linspace(0, Ta - 1, target_T).round().astype(int)
-            return audio[:, xs]
-        else:
-            return audio  # none
+        # Deprecated: audio is pre-aligned during feature build. Keep as no-op.
+        return audio
 
     def _pool_audio(self, audio):
         # mean pool over time -> (F,)
@@ -120,22 +106,42 @@ class AISTPPMotionAudioDataset(data.Dataset):
         # optional conversion to HumanML feature representation
         if self.opt.remap_joints:
             motion = self._to_humanml_features(motion)
-        m_length = motion.shape[0]
+        orig_len = motion.shape[0]
         # crop to max_motion_length if needed
-        if m_length > self.opt.max_motion_length:
-            start = random.randint(0, m_length - self.opt.max_motion_length)
+        start = 0
+        if orig_len > self.opt.max_motion_length:
+            start = random.randint(0, orig_len - self.opt.max_motion_length)
             motion = motion[start:start + self.opt.max_motion_length]
-            m_length = motion.shape[0]
         # pad if shorter
-        if m_length < self.opt.max_motion_length:
-            motion = np.concatenate([motion, np.zeros((self.opt.max_motion_length - m_length, motion.shape[1]), dtype=np.float32)], axis=0)
+        if orig_len < self.opt.max_motion_length:
+            pad_T = self.opt.max_motion_length - orig_len
+            motion = np.concatenate([motion, np.zeros((pad_T, motion.shape[1]), dtype=np.float32)], axis=0)
         # normalize motion (mean/std should match chosen representation)
+        m_length = motion.shape[0]
         if self.motion_mean is not None and self.motion_std is not None:
             motion = (motion - self.motion_mean) / self.motion_std
 
         audio = self._load_audio(audio_path)  # (F, T_a)
-        # Always produce per-frame time-aligned audio embeddings (ignore pool_audio for dataset output)
-        audio = self._time_align_audio(audio, m_length)
+        # Expect audio features pre-aligned to original motion length (before crop/pad).
+        # Handle minor off-by-one due to representation changes (e.g., HumanML T-1) or rounding.
+        F, T_a = audio.shape
+        if T_a - 1 != orig_len:
+            print(f'[INFO] Audio length {T_a - 1} differs from original motion length {orig_len} for {audio_path}, aligning...')
+            if abs(T_a - 1 - orig_len) == 1:
+                if T_a - 1 > orig_len:
+                    audio = audio[:, :orig_len + 1]
+                else:
+                    audio = np.concatenate([audio, np.zeros((F, orig_len - T_a + 1), dtype=audio.dtype)], axis=1)
+            else:
+                # As a safe fallback, linearly resample once to orig_len; expected to be rare if builder aligned.
+                xs = np.linspace(0, T_a - 1 - 1, orig_len)
+                audio = np.stack([np.interp(xs, np.arange(T_a - 1), audio[f]) for f in range(F)], axis=0)
+        # Apply the same crop/pad to audio as applied to motion
+        if orig_len > self.opt.max_motion_length:
+            audio = audio[:, start:start + self.opt.max_motion_length]
+        if orig_len < self.opt.max_motion_length:
+            pad_T = self.opt.max_motion_length - orig_len
+            audio = np.concatenate([audio, np.zeros((audio.shape[0], pad_T), dtype=audio.dtype)], axis=1)
         audio_tokens = [f'a{i}' for i in range(audio.shape[1])]  # treat time steps as tokens
         audio_embeddings = audio.T  # (T, F)
         token_len = audio_embeddings.shape[0]
