@@ -34,7 +34,7 @@ Training
 
 Notes
 - The loader always time-aligns audio features to motion length (linear) and returns per-frame audio embeddings.
-- Collation enforces: `audio_emb` is per-frame `(B, T, F)`, while `text_embed` is a pooled global audio vector `(1, B, F)` to unify the text-conditioning interface.
+- Collation enforces: `audio_emb` is per-frame `(B, F, T)`, while `text_embed` is a pooled global audio vector `(1, B, F)` to unify the text-conditioning interface.
 - If you prefer HumanML conversion from raw SMPL joints, set `remap_joints=true` and compute HumanML stats. This requires PyTorch + SMPL + HumanML extractor.
 
 Data Access & Batch Structure
@@ -63,14 +63,14 @@ cond['y'] keys:
    text:               list[str] (empty strings here)
    tokens:             list[str] token strings (audio token codes)
    prefix:             (B, D_motion, 1, context_len)  
-   audio_embed_prefix: (B, context_len, F_audio)      
-   audio_embed_pred:   (B, pred_len,    F_audio)      
+   audio_embed_prefix: (B, F_audio, context_len)      
+   audio_embed_pred:   (B, F_audio, pred_len)      
    text_embed:         (1, B, F_audio)                # pooled global audio vector from pred window
    db_key:             list (None placeholders unless return_keys enabled)
 ```
 
 Shape examples (current behavior):
-- Prefix mode: `context_len=20`, `pred_len=40`, `batch_size=64` → `motion prefix (64,263,1,20)`, `motion inp (64,263,1,40)`, `audio_embed_prefix (64,20,60)`, `audio_embed_pred (64,40,60)`, `text_embed (1,64,60)`
+- Prefix mode: `context_len=20`, `pred_len=40`, `batch_size=64` → `motion prefix (64,263,1,20)`, `motion inp (64,263,1,40)`, `audio_embed_prefix (64,80,20)`, `audio_embed_pred (64,80,40)`, `text_embed (1,64,80)`
 
 Important dimensional conventions:
 - Motion ordering after collate is `(batch, D_motion, 1, pred_len)` rather than `(batch, 1, D_motion, pred_len)`; the singleton second dimension is retained for historical compatibility with other data reps.
@@ -86,8 +86,8 @@ loader = get_dataset_loader(name='aistpp', batch_size=64, num_frames=None, split
                             hml_mode='train', fixed_len=None, pred_len=40, context_len=20,
                             abs_path='CLoSD_dancing/closd/diffusion_planner', device=dist_util.dev())
 motion, cond = next(iter(loader))
-audio_prefix = cond['y']['audio_embed_prefix']  # (B, context_len, F_audio)
-audio_pred   = cond['y']['audio_embed_pred']    # (B, pred_len,    F_audio)
+audio_prefix = cond['y']['audio_embed_prefix']  # (B, F_audio, context_len)
+audio_pred   = cond['y']['audio_embed_pred']    # (B, F_audio, pred_len)
 text_embed   = cond['y']['text_embed']          # (1, B, F_audio)
 motion_prefix = cond['y']['prefix']             # (B, D_motion, 1, context_len)
 ```
