@@ -245,31 +245,65 @@ class TrainLoop:
                 if getattr(self.args, 'text_uncond_all', False):
                     cond['y']['text_uncond'] = True
 
-                # --- 若啟用 concat 模式，將 audio_emb 轉成 per-frame feature，與 motion 在 channel 維 concat ---
-                # motion: [B, D_motion, 1, T]
+                # --- 若啟用 concat 模式，依 README_AISTPP 的格式將 prefix+pred audio concat 到 motion channel ---
+                # motion: [B, D_motion, 1, T_motion]，T_motion = pred_len（非 prefix 任務）或 context_len+pred_len（prefix 任務）
                 if getattr(self.args, 'audio_concat_mode', 'none') == 'concat':
-                    audio_emb = cond['y'].get('audio_emb', None)
-                    if audio_emb is not None:
-                        # Debug: 檢查實際的 shape
-                        print('[AIST++ concat debug] motion.shape =', tuple(motion.shape))
-                        print('[AIST++ concat debug] audio_emb.shape =', tuple(audio_emb.shape))
-                        print('[AIST++ concat debug] audio_emb.dim =', audio_emb.dim())
+                    # 將當前 batch 的 concat 模式記錄在 cond['y']，方便 gaussian_diffusion 使用
+                    cond['y']['audio_concat_mode'] = 'concat'
 
-                        # audio_emb 預期為 [B, T, F_audio]
-                        if audio_emb.dim() == 3:
-                            # -> [B, F_audio, 1, T]
-                            audio_feat = audio_emb.permute(0, 2, 1).unsqueeze(2)
-                        elif audio_emb.dim() == 4 and audio_emb.shape[1] != motion.shape[1]:
-                            # 已經是 [B, T, F_audio, ?] 之類的，就盡量對齊成 [B, F_audio, 1, T]
-                            audio_feat = audio_emb.permute(0, 3, 1, 2)
+                    # 新版 AIST++ collate：
+                    #   audio_embed_prefix: (B, F_audio, context_len)
+                    #   audio_embed_pred:   (B, F_audio, pred_len)
+                    audio_prefix = cond['y'].get('audio_embed_prefix', None)
+                    audio_pred = cond['y'].get('audio_embed_pred', None)
+
+                    # 1) 建立 pred 段的 audio_feat_pred -> (B, F_audio, 1, T_pred)
+                    audio_feat_pred = None
+                    if audio_pred is not None:
+                        # (B, F_audio, T_pred) -> (B, T_pred, F_audio)
+                        audio_pred_tf = audio_pred.permute(0, 2, 1)
+                        T_motion = motion.shape[-1]
+
+                        B, T_audio, F_audio = audio_pred_tf.shape
+                        # 在時間維度對齊到 T_motion（截斷或 padding）
+                        if T_audio >= T_motion:
+                            audio_pred_trim = audio_pred_tf[:, :T_motion, :]
                         else:
-                            # fallback：嘗試視為 [B, F_audio, 1, T]
-                            audio_feat = audio_emb
+                            pad_len = T_motion - T_audio
+                            pad = torch.zeros(B, pad_len, F_audio, device=audio_pred.device, dtype=audio_pred.dtype)
+                            audio_pred_trim = torch.cat([audio_pred_tf, pad], dim=1)
 
-                        print('[AIST++ concat debug] motion.shape (for cat) =', tuple(motion.shape))
-                        print('[AIST++ concat debug] audio_feat.shape (for cat) =', tuple(audio_feat.shape))
+                        # -> (B, F_audio, 1, T_motion)
+                        audio_feat_pred = audio_pred_trim.permute(0, 2, 1).unsqueeze(2)
 
-                        x = torch.cat([motion, audio_feat], dim=1)
+                    # 2) 若有 prefix，將 audio_prefix concat 進 cond['y']['prefix'] 的 channel 維
+                    if 'prefix' in cond['y']:
+                        prefix_motion = cond['y']['prefix']  # (B, D_motion, 1, T_prefix)
+                        T_prefix = prefix_motion.shape[-1]
+
+                        if audio_prefix is not None:
+                            # (B, F_audio, T_prefix) -> (B, T_prefix, F_audio)
+                            audio_prefix_tf = audio_prefix.permute(0, 2, 1)
+                            Bp, T_ap, F_ap = audio_prefix_tf.shape
+                            # 通常 T_ap == T_prefix；保險起見仍做一次對齊
+                            if T_ap >= T_prefix:
+                                audio_pref_trim = audio_prefix_tf[:, :T_prefix, :]
+                            else:
+                                pad_len = T_prefix - T_ap
+                                pad = torch.zeros(Bp, pad_len, F_ap, device=audio_prefix.device, dtype=audio_prefix.dtype)
+                                audio_pref_trim = torch.cat([audio_prefix_tf, pad], dim=1)
+
+                            audio_feat_prefix = audio_pref_trim.permute(0, 2, 1).unsqueeze(2)  # (B, F_audio, 1, T_prefix)
+
+                            # 將 audio prefix concat 進 prefix motion，使其與後續 x 的 channel 維度一致
+                            cond['y']['prefix'] = torch.cat([prefix_motion, audio_feat_prefix], dim=1)
+
+                    # 3) 對 pred 段 concat：x = [motion, audio_pred]
+                    if audio_feat_pred is not None:
+                        # Debug: 若需檢查 concat 前後的 shape，可暫時開啟下列列印。
+                        # print('[AIST++ concat debug] motion.shape (for cat) =', tuple(motion.shape))
+                        # print('[AIST++ concat debug] audio_feat_pred.shape (for cat) =', tuple(audio_feat_pred.shape))
+                        x = torch.cat([motion, audio_feat_pred], dim=1)
                     else:
                         x = motion
                 else:

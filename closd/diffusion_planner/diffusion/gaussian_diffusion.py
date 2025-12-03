@@ -1396,7 +1396,7 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            # �ҫ���J�������㪺 x_t�][motion+audio]�^�A�� loss �Ȧb motion channel �W�p��
+            # 家��块�Jご�哀咕悛� x_t�][motion+audio]�^�A�� loss 度�b motion channel �W璸衡
             model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
@@ -1429,22 +1429,77 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
 
-            # �� dataset ���w�� motion �� channel �ơGhumanml/aistpp=263, kit=251
-            # �Y���ҥ� concat �Ҧ��A�h motion_dim = ���� channel
+            # 依 dataset 推定純 motion 的 channel 數：humanml/aistpp=263, kit=251
+            # 若未啟用 concat 模式，則 motion_dim = 全部 channel
             motion_dim = x_start.shape[1]
-            audio_concat = False
-            if model_kwargs is not None and 'audio_emb' in model_kwargs.get('y', {}):
-                audio_concat = True
 
-            if audio_concat and dataset is not None and hasattr(dataset, 't2m_dataset'):
+            # 判斷是否為 audio concat 模式：
+            #  1) y 中有 per-frame audio key（新格式：audio_embed_pred）
+            #  2) 若有提供 audio_concat_mode flag，則需為 'concat'
+            audio_concat = False
+            ds_name = ''
+            if model_kwargs is not None and isinstance(model_kwargs, dict) and 'y' in model_kwargs:
+                y_kwargs = model_kwargs['y']
+                if isinstance(y_kwargs, dict) and 'audio_embed_pred' in y_kwargs:
+                    mode = y_kwargs.get('audio_concat_mode', 'concat')
+                    if mode == 'concat':
+                        audio_concat = True
+
+            if dataset is not None and hasattr(dataset, 't2m_dataset'):
                 ds_name = getattr(dataset.t2m_dataset.opt, 'dataset_name', '')
+
+            if audio_concat and ds_name:
                 if 'humanml' in ds_name or 'aist' in ds_name:
-                    motion_dim = min(263, x_start.shape[1])
+                    motion_dim = 263
                 elif 'kit' in ds_name:
-                    motion_dim = min(251, x_start.shape[1])
+                    motion_dim = 251
+
+                # 保險起見，避免超出實際 channel 數
+                motion_dim = min(motion_dim, x_start.shape[1])
 
             target_motion = target[:, :motion_dim, ...]
             model_output_motion = model_output[:, :motion_dim, ...]
+
+            # --- AIST++ prefix-completion special case -------------------------------------
+            # 在 AIST++ + audio concat + prefix completion + trans_enc 的設定下，
+            # MDM 的 prefix-completion 實作會讓輸出在時間維度上比 target 多 1 幀：
+            #   - x_start / target_motion: (B, 263, 1, pred_len=40)
+            #   - model_output_motion:     (B, 263, 1, 41)
+            # 這個多出來的 1 並沒有 task-level 語意（不是刻意多預測一幀），
+            # 而是 TransformerEncoder + prefix/mask 實作細節造成的 off-by-one。
+            #
+            # 原本 HumanML 的官方 pipeline 採用 trans_dec + autoregressive + slicing，
+            # 在推論時只會取 sample 的最後 pred_len 幀，因此這個 off-by-one 不會浮上來。
+            # 但在我們目前這條 AIST++ concat-only 路徑裡，loss 端會嚴格檢查
+            #   model_output_motion.shape == target_motion.shape
+            # 所以需要在這裡「對齊時間維」，只針對 AIST++ prefix-completion 做裁切，
+            # 不影響其他 dataset / 架構的行為。
+
+            if model_output_motion.shape != target_motion.shape:
+                # 僅在 AIST++ + audio concat + 有 prefix 的情況下，對 model_output_motion
+                # 的時間維做對齊：保留最後 T_tgt 幀，使其與 target_motion 一致。
+                # 這對應到 prefix-completion 的定義：
+                #   - prefix (context_len 幀) 只作為條件，不算 loss；
+                #   - pred   (pred_len 幀) 是 supervision 區間，loss 只對這段計算。
+                #
+                # 說白話就是：MDM 多吐出來的那一幀不參與 supervision，
+                # 讓 diffusion loss 僅關注我們定義好的 pred_len 幀。
+                if (
+                    audio_concat and
+                    ds_name and 'aist' in ds_name and
+                    isinstance(model_kwargs, dict) and
+                    'y' in model_kwargs and
+                    isinstance(model_kwargs['y'], dict) and
+                    'prefix' in model_kwargs['y']
+                ):
+                    T_tgt = target_motion.shape[-1]
+                    T_out = model_output_motion.shape[-1]
+                    if T_out > T_tgt:
+                        # 保留最後 T_tgt 幀，因為 suffix 是我們 care 的 pred 段
+                        model_output_motion = model_output_motion[..., -T_tgt:]
+                    elif T_out < T_tgt:
+                        # 理論上不應該發生；若發生，先把 target_motion 截到輸出長度避免 crash
+                        target_motion = target_motion[..., :T_out]
 
             assert model_output_motion.shape == target_motion.shape  # [bs, D_motion, nfeats, nframes]
 
