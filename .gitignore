@@ -1,3 +1,5 @@
+*.zip
+*isaacgym/
 *.json
 
 # Byte-compiled / optimized / DLL files
@@ -132,6 +134,8 @@ data/*
 output/
 log/
 runs/
+
+*data/
 
 *.png
 *.jpg
