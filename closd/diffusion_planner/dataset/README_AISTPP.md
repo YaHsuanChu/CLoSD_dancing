@@ -30,7 +30,7 @@ Setup steps
 
 Training
 - Use dataset `aistpp` and disable text encoder (audio only):
-  - `--dataset aistpp --text_encoder_type none`
+   - `--dataset aistpp --text_encoder_type none`
 
 Notes
 - The loader always time-aligns audio features to motion length (linear) and returns per-frame audio embeddings.
@@ -91,6 +91,169 @@ audio_pred   = cond['y']['audio_embed_pred']    # (B, F_audio, pred_len)
 text_embed   = cond['y']['text_embed']          # (1, B, F_audio)
 motion_prefix = cond['y']['prefix']             # (B, D_motion, 1, context_len)
 ```
+
+
+## 中文補充：AIST++ 的 audio concat / cross-attention 模式
+
+這一節說明在 AIST++ 上，音訊特徵怎麼進入 DiP（MDM）模型，以及兩種實驗模式要怎麼設定 config。
+
+### 1. 資料流回顧
+
+- `motion`: 經過 collate 後為 `motion: (B, D_motion, 1, pred_len)`，AIST++ / HumanML 目前 `D_motion=263`。
+- `audio_embeddings` 經過 collate 後會被拆成：
+   - `cond['y']['audio_embed_prefix']: (B, F_audio, context_len)`
+   - `cond['y']['audio_embed_pred']:   (B, F_audio, pred_len)`
+- `text_embed`: `cond['y']['text_embed']: (1, B, F_audio)`，為 `audio_embed_pred` 在時間維度上的平均，做為「全域 audio token」，與原有 text-conditioning 介面對齊。
+
+在訓練 loop 中（`train/training_loop.py`），若 `audio_concat_mode='concat'`，會將 per-frame audio 特徵 concat 到 motion channel：
+
+- pred 段：
+   - `audio_embed_pred (B, F_audio, pred_len)` 會先轉成 `(B, F_audio, 1, pred_len)`；
+   - `x = concat(motion, audio_feat_pred, dim=1)` 變成 `(B, 263+F_audio, 1, pred_len)` 再送進 diffusion；
+- prefix 段（若有 prefix / completion 模式）：
+   - `audio_embed_prefix (B, F_audio, context_len)` 同樣轉成 `(B, F_audio, 1, context_len)`；
+   - concat 到 `cond['y']['prefix']`，讓 prefix 也包含 audio channel，與 pred 段的 channel 數對齊。
+
+在 diffusion loss 裡（`GaussianDiffusion.training_losses`），若偵測到：
+
+- `model_kwargs['y']['audio_embed_pred']` 存在，且 `audio_concat_mode='concat'`；
+- dataset name 包含 `humanml` 或 `aist`；
+
+則會只對前 `D_motion` 個 channel 計算 rot MSE：
+
+```python
+motion_dim = 263  # for humanml / aistpp
+target_motion = target[:, :motion_dim, ...]
+model_output_motion = model_output[:, :motion_dim, ...]
+rot_mse = masked_l2(target_motion, model_output_motion, mask)
+```
+
+也就是說，concat 上去的 audio channel 僅視為「輸入特徵」，不強迫模型重建它。
+
+為了修正 prefix-completion + `trans_enc` 架構下的時間維 off-by-one 問題，在 AIST++ + audio concat + 有 prefix 時，loss 端會對 model_output 在時間維度做一次 slicing，使其與 target 的 `pred_len` 對齊，只對指定的預測區間 supervision。
+
+### 2. 兩種常用實驗模式
+
+目前推薦在 AIST++ 上使用以下兩種設定來對照：
+
+#### 模式 A：純 concat（沒有 cross-attention）
+
+目標：
+
+- 模型只從輸入上的 `[motion, audio_channel]` 學習，不再透過任何 text/audio cross-attention 取條件。
+
+建議訓練指令（範例）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m closd.diffusion_planner.train.train_mdm \
+   --save_dir output/CLoSD/CLoSD_aistpp_concat_only \
+   --dataset aistpp \
+   --text_encoder_type none \
+   --audio_concat_mode concat \
+   --audio_dim 80 \
+   --audio_feat_dim 80 \
+   --batch_size 64 \
+   --num_frames 60 \
+   --num_steps 200000 \
+   --lr 1e-4 \
+   --text_uncond_all \
+   --lambda_target_loc 0.0 \
+   --context_len 20 \
+   --pred_len 40
+```
+
+說明：
+
+- `--text_encoder_type none`：不載入 CLIP/BERT，MDM 只使用 `y['text_embed']`（此處為 pooled audio）作為介面，但我們會在下面關掉它。
+- `--audio_concat_mode concat`：開啟 per-frame audio concat 到 motion channel 的路徑。
+- `--audio_dim` / `--audio_feat_dim`：必須與 `build_aistpp_audio_feats.py` 產生的 audio feature 維度一致（預設 80）。
+- `--text_uncond_all`：訓練時每個 batch 都設 `cond['y']['text_uncond']=True`，
+   讓 MDM 的 `mask_cond(..., force_mask=True)` 把所有 text/audio/action cond 向量歸零，相當於關掉 cross-attention；
+   此時模型唯一「看到」的 audio 資訊就是輸入 $x$ 上 concat 的 per-frame audio channel。
+
+#### 模式 B：concat + pooled audio cross-attention
+
+目標：
+
+- 同時使用：
+   - 輸入上的 per-frame audio channel（concat）、
+   - 以及 pooled 的 global audio 向量（`text_embed`）作為 cross-attention 的條件。
+
+建議訓練指令（範例）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m closd.diffusion_planner.train.train_mdm \
+   --save_dir output/CLoSD/CLoSD_aistpp_concat_xattn \
+   --dataset aistpp \
+   --text_encoder_type none \
+   --audio_concat_mode concat \
+   --audio_dim 80 \
+   --audio_feat_dim 80 \
+   --batch_size 64 \
+   --num_frames 60 \
+   --num_steps 200000 \
+   --lr 1e-4 \
+   --lambda_target_loc 0.0 \
+   --context_len 20 \
+   --pred_len 40
+```
+
+與模式 A 的差別在於：
+
+- **沒有** 帶 `--text_uncond_all`，因此：
+   - `cond['y']['text_embed']`（即 pooled audio 向量）會經過 `embed_text`；
+   - 在 `MDM.forward` 中與時間嵌入 `time_emb` 結合後，作為 Transformer 的條件，透過 cross-attention 影響整段 motion；
+   - 同時輸入 $x$ 上仍然是 `[motion, audio_channel]` 的 concat。
+
+此模式允許模型同時利用：
+
+- 全域 audio 語意（透過 cross-attention），
+- 局部 per-frame audio 資訊（透過 concat channel）。
+
+### 3. 總結與建議
+
+- 若你只想要「讓音樂訊號長在 motion 上」，不希望有任何 cross-attention 分支干擾，建議使用：
+   - **模式 A（純 concat）**：`audio_concat_mode='concat'` + `text_uncond_all`。
+
+- 若你想比較「global audio token 作為條件」對品質的影響，則使用：
+   - **模式 B（concat + pooled cross-attention）**：`audio_concat_mode='concat'`，不要設 `text_uncond_all`，並保留 `text_embed`。
+
+兩種模式共用同一套 data loader 與 stats/builder 流程，只透過 CLI 旗標與 cond flag 切換，方便在同一訓練程式中做 ablation 與比較。
+
+
+### 4. Sampling 範例（生成音訊條件動作）
+
+假設你已經用上面的設定訓練好一個 AIST++ 模型，checkpoint 存在：
+
+- `--save_dir output/CLoSD/CLoSD_aistpp_concat_only`（或 `CLoSD_aistpp_concat_xattn`）
+
+可以使用 `sample/generate.py` 進行條件生成，例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m closd.diffusion_planner.sample.generate \
+   --model_path output/CLoSD/CLoSD_aistpp_concat_only/model200000.pt \
+   --save_dir output/CLoSD/CLoSD_aistpp_concat_only/samples \
+   --dataset aistpp \
+   --text_encoder_type none \
+   --audio_concat_mode concat \
+   --audio_dim 80 \
+   --audio_feat_dim 80 \
+   --batch_size 16 \
+   --num_samples 64 \
+   --context_len 20 \
+   --pred_len 40
+```
+
+關鍵說明：
+
+- `--dataset aistpp`：會啟用 AIST++ 的 data loader，從 `data/aistpp/audio_feats` 載入對應音檔的特徵，並自動時間對齊到 motion 長度。
+- `--text_encoder_type none`：與訓練時一致，表示不另外跑 CLIP/BERT，只使用 `y['text_embed']` 中的 pooled audio 作為 text-cond 介面。
+- `--audio_concat_mode concat` + `--audio_dim/--audio_feat_dim`：需與訓練時完全一致，否則模型輸入維度會不對齊。
+- `--context_len` / `--pred_len`：需與訓練時保持相同（例如 20 / 40），特別是 prefix-completion 模式下，這兩個值會決定 prefix 與生成區間的長度。
+
+在 `generate.py` 內部，若偵測到 `audio_concat_mode='concat'` 且 channel 數大於 motion_dim（humanml/aistpp 預設為 263），會在輸出後自動截掉多出來的 audio channel，只保留前 263 維作為動作特徵，方便後續還原/視覺化。
+
+
 
 
 ## 中文補充：AIST++ 的 audio concat / cross-attention 模式
