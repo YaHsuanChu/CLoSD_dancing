@@ -1508,7 +1508,9 @@ class GaussianDiffusion:
             if self.lambda_target_loc > 0.:
                 assert self.model_mean_type == ModelMeanType.START_X, 'This feature supports only X_start pred for now!'
                 ref_target = model_kwargs['y']['target_cond']
-                pred_target = get_target_location(model_output, dataset.mean_gpu, dataset.std_gpu, 
+                # 若啟用了 audio concat，model_output 的 channel 會比 motion 維度大（多出 audio dim）。
+                # target_loc loss 只關心純 motion，所以沿用上面裁切過的 model_output_motion。
+                pred_target = get_target_location(model_output_motion, dataset.mean_gpu, dataset.std_gpu, 
                                             model_kwargs['y']['lengths'], dataset.t2m_dataset.opt.joints_num, model.all_goal_joint_names, 
                                             model_kwargs['y']['target_joint_names'], model_kwargs['y']['is_heading'])
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
