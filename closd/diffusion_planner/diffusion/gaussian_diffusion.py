@@ -1375,7 +1375,6 @@ class GaussianDiffusion:
         mask = model_kwargs['y']['mask']
         if 'keyframe_mask' in model_kwargs['y'].keys():
             mask = torch.logical_and(mask, ~model_kwargs['y']['keyframe_mask'])  # exclude keyframes from loss
-
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
@@ -1396,7 +1395,7 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            # 家��块�Jご�哀咕悛� x_t�][motion+audio]�^�A�� loss 度�b motion channel �W璸衡
+            # Here x_t may contain [motion+audio], but the loss will be computed only on motion channels
             model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
@@ -1441,7 +1440,7 @@ class GaussianDiffusion:
             if model_kwargs is not None and isinstance(model_kwargs, dict) and 'y' in model_kwargs:
                 y_kwargs = model_kwargs['y']
                 if isinstance(y_kwargs, dict) and 'audio_embed_pred' in y_kwargs:
-                    mode = y_kwargs.get('audio_concat_mode', 'concat')
+                    mode = y_kwargs.get('audio_concat_mode', 'none')
                     if mode == 'concat':
                         audio_concat = True
 

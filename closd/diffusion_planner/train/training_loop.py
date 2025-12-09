@@ -232,7 +232,7 @@ class TrainLoop:
             for motion, cond in tqdm(self.data):
                 if not (not self.lr_anneal_steps or self.total_step() < self.lr_anneal_steps):
                     break
-                
+
                 self.cond_modifiers(cond['y'], motion) # Modify in-place for efficiency
                 motion = motion.to(self.device)
                 cond['y'] = {key: val.to(self.device) if torch.is_tensor(val) else val for key, val in cond['y'].items()}
