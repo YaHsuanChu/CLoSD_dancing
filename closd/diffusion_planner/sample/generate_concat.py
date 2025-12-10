@@ -22,10 +22,44 @@ from closd.diffusion_planner.utils import cond_util
 from closd.diffusion_planner.data_loaders import humanml_utils
 
 
+"""
+python -m closd.diffusion_planner.sample.generate_concat \
+  --model_path output/aistpp_trained_models/concat_ng40/model000600000.pt \
+  --device 0 \
+  --dataset aistpp \
+  --audio_concat_mode concat \
+  --audio_dim 80 \
+  --audio_feat_dim 80 \
+  --context_len 20 \
+  --pred_len 40 \
+  --num_samples 3 \
+  --num_repetitions 1 \
+  --batch_size 3 \
+  --motion_length 3 \
+  --seed 123 \
+  --sampling_mode goal \
+  --target_joint_source data
+"""
+
 def main(args=None):
+    """Sampling script specialized for AIST++ concat models.
+
+    - Default dataset: aistpp
+    - Uses per-frame audio concatenated to motion during training.
+    - During sampling we may still use HumanML-style text/action interfaces,
+      but for pure audio-conditioned AIST++ runs we rely on the dataset loader
+      (no additional text/action input is required).
+    """
     if args is None:
         # args is None unless this method is called from another function (e.g. during training)
         args = generate_args()
+
+    # If not explicitly set, default to AIST++ concat config similar to training
+    if getattr(args, 'dataset', None) is None or args.dataset == '':
+        args.dataset = 'aistpp'
+    if not hasattr(args, 'audio_concat_mode') or args.audio_concat_mode is None:
+        # match training setup in concat_ng40
+        args.audio_concat_mode = 'concat'
     fixseed(args.seed)
     out_path = args.output_dir
     # AIST++ uses the same HumanML3D representation (263-dim -> 22 joints)
@@ -39,6 +73,8 @@ def main(args=None):
     if args.pred_len > 0 and not args.autoregressive:
         n_frames = args.pred_len
         max_frames = args.context_len + args.pred_len
+    # For pure AIST++ audio-conditioned runs we typically do not provide
+    # extra text/action prompts; everything comes from the dataset.
     is_using_data = not any([args.input_text, args.text_prompt, args.action_file, args.action_name])
     dist_util.setup_dist(args.device)
     if out_path == '':
@@ -126,6 +162,31 @@ def main(args=None):
         _, model_kwargs = collate(collate_args)
 
     model_kwargs['y'] = {key: val.to(dist_util.dev()) if torch.is_tensor(val) else val for key, val in model_kwargs['y'].items()}
+
+    # --- 若啟用 concat 模式，讓 prefix 的 channel 也包含 audio，與訓練時保持一致 ---
+    if getattr(args, 'audio_concat_mode', 'none') == 'concat':
+        y = model_kwargs['y']
+        audio_prefix = y.get('audio_embed_prefix', None)  # (B, F_audio, T_prefix)
+
+        if 'prefix' in y and audio_prefix is not None:
+            prefix_motion = y['prefix']  # (B, D_motion, 1, T_prefix)
+            T_prefix = prefix_motion.shape[-1]
+
+            # (B, F_audio, T_prefix) -> (B, T_prefix, F_audio)
+            audio_prefix_tf = audio_prefix.permute(0, 2, 1)
+            Bp, T_ap, F_ap = audio_prefix_tf.shape
+            # 通常 T_ap == T_prefix；保險起見仍做一次對齊
+            if T_ap >= T_prefix:
+                audio_pref_trim = audio_prefix_tf[:, :T_prefix, :]
+            else:
+                pad_len = T_prefix - T_ap
+                pad = torch.zeros(Bp, pad_len, F_ap, device=audio_prefix.device, dtype=audio_prefix.dtype)
+                audio_pref_trim = torch.cat([audio_prefix_tf, pad], dim=1)
+
+            audio_feat_prefix = audio_pref_trim.permute(0, 2, 1).unsqueeze(2)  # (B, F_audio, 1, T_prefix)
+
+            # 將 audio prefix concat 進 prefix motion，使其與模型的 x channel 維度一致（263 + F_audio）
+            y['prefix'] = torch.cat([prefix_motion, audio_feat_prefix], dim=1)
     init_image = None
     if args.spatial_condition is not None:
         if args.spatial_condition == 'traj':
@@ -203,7 +264,9 @@ def main(args=None):
             cond_fn=cond_fn,
         )
 
-        # When concatenating audio, account for extra channels beyond the motion joints
+        # When concatenating audio, account for extra channels beyond the motion joints.
+        # Training concatenates per-frame audio features along the channel dimension,
+        # so here we strip them away and keep only the motion part before inverse transforms.
         if getattr(args, 'audio_concat_mode', 'none') == 'concat':
             if args.dataset in ['humanml', 'aistpp']:
                 motion_dim = 263
@@ -216,16 +279,40 @@ def main(args=None):
                 sample = sample[:, :motion_dim, ...]
         
 
-        if args.multi_target_cond:
-            prefix_end_heading = get_target_location(sample[..., :args.context_len], data.dataset.mean_gpu, data.dataset.std_gpu, 
-                                                    torch.tensor([args.context_len] * args.num_samples), 
-                                                    data.dataset.t2m_dataset.opt.joints_num, model.all_goal_joint_names,
-                                                    model_kwargs['y']['target_joint_names'], is_heading=model_kwargs['y']['is_heading'])[:, -1, 0]
-            model_kwargs['y']['heading_cond'] = prefix_end_heading + model_kwargs['y']['target_cond'][:, -1, 0]
-            model_kwargs['y']['heading_pred_cond'] = get_target_location(sample, data.dataset.mean_gpu, data.dataset.std_gpu, 
-                                                    torch.tensor([sample.shape[-1]] * args.num_samples), 
-                                                    data.dataset.t2m_dataset.opt.joints_num, model.all_goal_joint_names,
-                                                    model_kwargs['y']['target_joint_names'], is_heading=model_kwargs['y']['is_heading'])[:, -1, 0]
+        # Optional multi-target heading diagnostics.
+        # 在 goal sampling 模式下，如果 y 中包含 target_joint_names / is_heading / target_cond，
+        # 則計算 prefix 結尾與完整序列的 heading，方便做可視化與分析。
+        if (
+            args.multi_target_cond
+            and 'target_joint_names' in model_kwargs['y']
+            and 'is_heading' in model_kwargs['y']
+            and 'target_cond' in model_kwargs['y']
+        ):
+            prefix_end_heading = get_target_location(
+                sample[..., :args.context_len],
+                data.dataset.mean_gpu,
+                data.dataset.std_gpu,
+                torch.tensor([args.context_len] * args.num_samples),
+                data.dataset.t2m_dataset.opt.joints_num,
+                model.all_goal_joint_names,
+                model_kwargs['y']['target_joint_names'],
+                is_heading=model_kwargs['y']['is_heading'],
+            )[:, -1, 0]
+
+            model_kwargs['y']['heading_cond'] = (
+                prefix_end_heading + model_kwargs['y']['target_cond'][:, -1, 0]
+            )
+
+            model_kwargs['y']['heading_pred_cond'] = get_target_location(
+                sample,
+                data.dataset.mean_gpu,
+                data.dataset.std_gpu,
+                torch.tensor([sample.shape[-1]] * args.num_samples),
+                data.dataset.t2m_dataset.opt.joints_num,
+                model.all_goal_joint_names,
+                model_kwargs['y']['target_joint_names'],
+                is_heading=model_kwargs['y']['is_heading'],
+            )[:, -1, 0]
      
         
         if model.data_rep == 'hml_vec':
