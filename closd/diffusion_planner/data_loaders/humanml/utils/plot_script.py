@@ -89,10 +89,11 @@ def plot_3d_motion(save_path, kinematic_tree, joints, title, dataset, figsize=(3
         #     print(f"pdata[-1,0]: {data[-1,0].round(3)}")
         
     # preparation related to specific datasets
+    scale = 1.0  # sensible default to avoid undefined scale on new datasets
     if dataset == 'kit':
         scale = 0.003  # scale for visualization
-    elif dataset == 'humanml':
-        scale = 1.3  # scale for visualization
+    elif dataset in ['humanml', 'aistpp']:
+        scale = 1.3  # scale for visualization (aistpp uses humanml-style features)
     elif dataset in ['humanact12', 'uestc']:
         scale = -1.5 # reverse axes, scale for visualization
     data *= scale

@@ -28,7 +28,8 @@ def main(args=None):
         args = generate_args()
     fixseed(args.seed)
     out_path = args.output_dir
-    n_joints = 22 if args.dataset == 'humanml' else 21
+    # AIST++ uses the same HumanML3D representation (263-dim -> 22 joints)
+    n_joints = 22 if args.dataset in ['humanml', 'aistpp'] else 21
     name = os.path.basename(os.path.dirname(args.model_path))
     niter = os.path.basename(args.model_path).replace('model', '').replace('.pt', '')
     max_frames = 196 if args.dataset in ['kit', 'humanml'] else 60
@@ -238,9 +239,15 @@ def main(args=None):
 
         if args.unconstrained:
             all_text += ['unconstrained'] * args.num_samples
+        elif 'text' in model_kwargs['y']:
+            all_text += model_kwargs['y']['text']
+        elif 'action_text' in model_kwargs['y']:
+            all_text += model_kwargs['y']['action_text']
+        elif args.dataset == 'aistpp':
+            # AIST++ audio-only sampling has no text/action labels; keep placeholders for filenames
+            all_text += ['audio_cond'] * args.num_samples
         else:
-            text_key = 'text' if 'text' in model_kwargs['y'] else 'action_text'
-            all_text += model_kwargs['y'][text_key]
+            raise KeyError("Expected 'text' or 'action_text' in model_kwargs['y']")
 
         all_motions.append(sample.cpu().numpy())
         _len = model_kwargs['y']['lengths'].cpu().numpy()
