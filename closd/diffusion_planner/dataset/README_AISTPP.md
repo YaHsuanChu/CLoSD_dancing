@@ -171,52 +171,43 @@ CUDA_VISIBLE_DEVICES=0 python -m closd.diffusion_planner.train.train_mdm \
    讓 MDM 的 `mask_cond(..., force_mask=True)` 把所有 text/audio/action cond 向量歸零，相當於關掉 cross-attention；
    此時模型唯一「看到」的 audio 資訊就是輸入 $x$ 上 concat 的 per-frame audio channel。
 
-#### 模式 B：concat + pooled audio cross-attention
+#### 模式 B：per-frame audio cross-attention（不做 concat）
 
 目標：
 
-- 同時使用：
-   - 輸入上的 per-frame audio channel（concat）、
-   - 以及 pooled 的 global audio 向量（`text_embed`）作為 cross-attention 的條件。
+- 不在 $x$ 上 concat audio channel，而是把 prefix/pred 的每一幀 audio 特徵當作 cross-attention 的 memory token。
+- 透過 `--text_uncond_all` 關閉 pooled audio/text cond，避免與 per-frame token 重複。
 
 建議訓練指令（範例）：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m closd.diffusion_planner.train.train_mdm \
-   --save_dir output/CLoSD/CLoSD_aistpp_concat_xattn \
+python -m closd.diffusion_planner.train.train_mdm \
+   --save_dir output/diffusion/aistpp_per_frame_cross_attn_only_ng20 \
    --dataset aistpp \
    --text_encoder_type none \
-   --audio_concat_mode concat \
-   --audio_dim 80 \
-   --audio_feat_dim 80 \
-   --batch_size 64 \
-   --num_frames 60 \
-   --num_steps 200000 \
-   --lr 1e-4 \
-   --lambda_target_loc 0.0 \
-   --context_len 20 \
-   --pred_len 40
+   --audio_concat_mode none --text_uncond_all --per_frame_audio_xatten \
+   --arch trans_dec \
+   --audio_dim 80 --audio_feat_dim 80 \
+   --batch_size 64 --num_steps 200000 \
+   --num_frames 40 --context_len 20 --pred_len 20 \
+   --lambda_target_loc 0.0 --device 6
 ```
 
 與模式 A 的差別在於：
 
-- **沒有** 帶 `--text_uncond_all`，因此：
-   - `cond['y']['text_embed']`（即 pooled audio 向量）會經過 `embed_text`；
-   - 在 `MDM.forward` 中與時間嵌入 `time_emb` 結合後，作為 Transformer 的條件，透過 cross-attention 影響整段 motion；
-   - 同時輸入 $x$ 上仍然是 `[motion, audio_channel]` 的 concat。
+- `--audio_concat_mode none`：$x$ 輸入只包含 motion，沒有 audio channel。
+- `--per_frame_audio_xatten`：`audio_embed_prefix/pred` 會經 `embed_text` + `sequence_pos_encoder` 後，拼到 decoder 的 memory 序列，讓跨注意力看到每一幀 audio token。
+- `--text_uncond_all`：pooled audio（`text_embed`）會被 mask_cond 清為 0，不再進入 cross-attention，避免與 per-frame audio token 重複。
 
-此模式允許模型同時利用：
-
-- 全域 audio 語意（透過 cross-attention），
-- 局部 per-frame audio 資訊（透過 concat channel）。
+此模式讓模型只透過 cross-attention 看 per-frame audio token，motion 輸入乾淨且不需重建 audio channel。
 
 ### 3. 總結與建議
 
 - 若你只想要「讓音樂訊號長在 motion 上」，不希望有任何 cross-attention 分支干擾，建議使用：
    - **模式 A（純 concat）**：`audio_concat_mode='concat'` + `text_uncond_all`。
 
-- 若你想比較「global audio token 作為條件」對品質的影響，則使用：
-   - **模式 B（concat + pooled cross-attention）**：`audio_concat_mode='concat'`，不要設 `text_uncond_all`，並保留 `text_embed`。
+- 若你想比較「只用 per-frame audio token 透過 cross-attention」對品質的影響，則使用：
+   - **模式 B（per-frame cross-attention）**：`audio_concat_mode='none'` + `per_frame_audio_xatten` + `text_uncond_all`。
 
 兩種模式共用同一套 data loader 與 stats/builder 流程，只透過 CLI 旗標與 cond flag 切換，方便在同一訓練程式中做 ablation 與比較。
 
@@ -225,9 +216,10 @@ CUDA_VISIBLE_DEVICES=0 python -m closd.diffusion_planner.train.train_mdm \
 
 假設你已經用上面的設定訓練好一個 AIST++ 模型，checkpoint 存在：
 
-- `--save_dir output/CLoSD/CLoSD_aistpp_concat_only`（或 `CLoSD_aistpp_concat_xattn`）
+- 模式 A：`--save_dir output/CLoSD/CLoSD_aistpp_concat_only`
+- 模式 B：`--save_dir output/diffusion/aistpp_per_frame_cross_attn_only_ng20`
 
-可以使用 `sample/generate.py` 進行條件生成，例如：
+可以使用 `sample/generate.py` 進行條件生成，例如（模式 A 範例）：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m closd.diffusion_planner.sample.generate \
@@ -248,7 +240,7 @@ CUDA_VISIBLE_DEVICES=0 python -m closd.diffusion_planner.sample.generate \
 
 - `--dataset aistpp`：會啟用 AIST++ 的 data loader，從 `data/aistpp/audio_feats` 載入對應音檔的特徵，並自動時間對齊到 motion 長度。
 - `--text_encoder_type none`：與訓練時一致，表示不另外跑 CLIP/BERT，只使用 `y['text_embed']` 中的 pooled audio 作為 text-cond 介面。
-- `--audio_concat_mode concat` + `--audio_dim/--audio_feat_dim`：需與訓練時完全一致，否則模型輸入維度會不對齊。
+- `--audio_concat_mode concat` + `--audio_dim/--audio_feat_dim`：需與訓練時完全一致，否則模型輸入維度會不對齊。（模式 B 則改為 `audio_concat_mode none`，並加上 `--per_frame_audio_xatten`。）
 - `--context_len` / `--pred_len`：需與訓練時保持相同（例如 20 / 40），特別是 prefix-completion 模式下，這兩個值會決定 prefix 與生成區間的長度。
 
 在 `generate.py` 內部，若偵測到 `audio_concat_mode='concat'` 且 channel 數大於 motion_dim（humanml/aistpp 預設為 263），會在輸出後自動截掉多出來的 audio channel，只保留前 263 維作為動作特徵，方便後續還原/視覺化。
@@ -317,44 +309,34 @@ $$
 
 模型看到的唯一「條件」就是輸入 $x$ 上的 motion + audio channel，沒有額外的 cross-attention 訊息。
 
-#### 模式 B：concat + pooled audio cross-attention
+#### 模式 B：per-frame audio cross-attention（不做 concat）
 
 目標：
-- 同時使用：
-   - 輸入上的 per-frame audio channel（concat）、
-   - 以及 pooled 的 global audio 向量（`text_embed`）作為 cross-attention 的條件。
+- $x$ 只保留 motion；prefix/pred 的每一幀 audio 特徵改由 cross-attention 訪問。
 
 建議設定：
 
-- 在訓練 / 生成腳本中：
-   - `--dataset aistpp`
-   - `--text_encoder_type none`  （讓 MDM 直接使用 `y['text_embed']`，不再呼叫 CLIP/BERT）
-   - `--audio_concat_mode concat`
-   - `--audio_dim 80`
-   - **不要** 帶 `--text_uncond_all`（或保持預設 False）。
+- `--dataset aistpp`
+- `--text_encoder_type none`
+- `--audio_concat_mode none`
+- `--per_frame_audio_xatten`
+- `--text_uncond_all`（遮蔽 pooled audio/text cond，只保留 per-frame audio token）
 
-- 在 `model_kwargs['y']` / loader 中維持預設行為：
-   - `cond['y']['text_embed']` 仍為 `(1, B, F_audio)` 的 pooled audio token，
-   - `y` 中沒有 `text_uncond` 或為 False，cross-attention 會正常看到這個 global audio token。
+條件流說明：
 
-這樣 MDM 會：
-
-1. 把 pooled audio token 經過 `embed_text`，作為 cross-attention 的 conditioning；
-2. 同時看到輸入上的 `[motion, per-frame audio_channel]`；
-3. diffusion loss 仍然只對前 263 維 motion channel 做 supervision。
+1. `audio_embed_prefix/pred` 經 `embed_text` + `sequence_pos_encoder`，拼到 decoder memory，跨注意力逐幀使用。
+2. 由於 `text_uncond_all=True`，pooled audio（`text_embed`）會被 mask_cond 清為 0，不再進入 cross-attention。
+3. 輸入 $x$ 沒有 audio channel，因此 diffusion loss 仍只覆蓋 motion channel。
 
 ### 3. 總結與建議
 
 - 若你只想要「讓音樂長在 motion 上」，不希望有任何 cross-attention 分支干擾：
    - 選擇 **模式 A（純 concat）**：`audio_concat_mode='concat'` + `text_uncond=True`。
 
-- 若你想比較「global audio token 作為條件」對品質的影響：
-   - 選擇 **模式 B（concat + pooled cross-attention）**：`audio_concat_mode='concat'` + `text_uncond=False`，並保留 `text_embed`。
+- 若你想比較「只靠 per-frame audio token 的 cross-attention」對品質的影響：
+   - 選擇 **模式 B（per-frame cross-attention）**：`audio_concat_mode='none'` + `per_frame_audio_xatten` + `text_uncond_all`。
 
 兩種模式共用同一套 data loader 与 stats/builder 流程，僅透過 config / cond flag 來切換，方便在同一訓練程式中做 ablation 與比較。其中：
 
 - 是否 concat audio：由 `--audio_concat_mode` 控制；
 - 是否完全關掉 cross-attention：由 `--text_uncond_all`（訓練）或自行在 y 裡設 `text_uncond=True`（其他使用情境）來控制。
-
-
-
