@@ -86,6 +86,7 @@ def get_model_args(args, data):
             'pred_len': args.pred_len, 'context_len': args.context_len, 'emb_policy': emb_policy,
             'all_goal_joint_names': all_goal_joint_names, 'multi_target_cond': multi_target_cond, 'multi_encoder_type': multi_encoder_type, 'target_enc_layers': target_enc_layers,
             'audio_concat_mode': audio_concat_mode,
+            'per_frame_audio_xatten': getattr(args, 'per_frame_audio_xatten', False),
             }
 
 
