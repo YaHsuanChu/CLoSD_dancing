@@ -189,7 +189,7 @@ python -m closd.diffusion_planner.train.train_mdm \
    --arch trans_dec \
    --audio_dim 80 --audio_feat_dim 80 \
    --batch_size 64 --num_steps 200000 \
-   --num_frames 40 --context_len 20 --pred_len 20 \
+   --num_frames 60 --context_len 20 --pred_len 40 \
    --lambda_target_loc 0.0 --device 6
 ```
 
@@ -198,8 +198,8 @@ python -m closd.diffusion_planner.train.train_mdm \
 - `--audio_concat_mode none`：$x$ 輸入只包含 motion，沒有 audio channel。
 - `--per_frame_audio_xatten`：`audio_embed_prefix/pred` 會經 `embed_text` + `sequence_pos_encoder` 後，拼到 decoder 的 memory 序列，讓跨注意力看到每一幀 audio token。
 - `--text_uncond_all`：pooled audio（`text_embed`）會被 mask_cond 清為 0，不再進入 cross-attention，避免與 per-frame audio token 重複。
+- `--arch tans_dec` : 原本 concat 模式是使用 trans_enc, 而 cross attention 模式必須使用 trans_dec 模式，因為 nn.TransformerDecoder 才有 cross attention 的機制
 
-此模式讓模型只透過 cross-attention 看 per-frame audio token，motion 輸入乾淨且不需重建 audio channel。
 
 ### 3. 總結與建議
 
@@ -320,6 +320,7 @@ $$
 - `--text_encoder_type none`
 - `--audio_concat_mode none`
 - `--per_frame_audio_xatten`
+- `--arch trans_dec`
 - `--text_uncond_all`（遮蔽 pooled audio/text cond，只保留 per-frame audio token）
 
 條件流說明：
