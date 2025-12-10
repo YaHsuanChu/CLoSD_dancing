@@ -202,7 +202,7 @@ def main(args=None):
             cond_fn=cond_fn,
         )
 
-        # 若啟用 concat 模式且 channel 數大於純 motion joints，先切掉 audio channel
+        # When concatenating audio, account for extra channels beyond the motion joints
         if getattr(args, 'audio_concat_mode', 'none') == 'concat':
             if args.dataset in ['humanml', 'aistpp']:
                 motion_dim = 263
