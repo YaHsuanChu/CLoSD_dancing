@@ -157,6 +157,18 @@ class AISTPPMotionAudioDataset(data.Dataset):
         
         return ret
 
+    def inv_transform(self, data):
+        """Invert the normalization applied to motion features."""
+        if self.motion_mean is None or self.motion_std is None:
+            return data
+        if isinstance(data, torch.Tensor):
+            mean = torch.as_tensor(self.motion_mean, device=data.device, dtype=data.dtype)
+            std = torch.as_tensor(self.motion_std, device=data.device, dtype=data.dtype)
+        else:
+            mean = self.motion_mean
+            std = self.motion_std
+        return data * std + mean
+
 class AISTPP(data.Dataset):
     """Wrapper to mirror HumanML3D interface used by get_data factory."""
     def __init__(self, mode, datapath='./dataset/aistpp_opt.txt', split='train', **kwargs):

@@ -41,7 +41,7 @@ def get_model_args(args, data):
     all_goal_joint_names = []
 
     if args.dataset == 'humanml':
-        # 純文字 T2M：263 維 motion
+    # HumanML/T2M uses 263-dim motion
         data_rep = 'hml_vec'
         njoints = 263
         nfeats = 1
@@ -51,7 +51,7 @@ def get_model_args(args, data):
         njoints = 251
         nfeats = 1
     elif args.dataset == 'aistpp':
-        # AIST++：motion 263 維，可選擇是否 concat audio 成為額外通道
+    # AIST++: base motion dim is 263; optionally concat audio to increase the channel count
         data_rep = 'hml_vec'
         motion_dim = 263
         if getattr(args, 'audio_concat_mode', 'none') == 'concat':
