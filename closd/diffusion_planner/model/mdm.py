@@ -50,7 +50,9 @@ class MDM(nn.Module):
         self.cond_mask_prob = kargs.get('cond_mask_prob', 0.)
         self.emb_before_mask = kargs.get('emb_before_mask', False)
         self.mask_frames = kargs.get('mask_frames', False)
-        self.arch = arch
+        self.per_frame_audio_xatten = kargs.get('per_frame_audio_xatten', False) # to control whether to use per-frame audio sequece in cross attention
+        print('self.per_frame_audio_xatten = ', self.per_frame_audio_xatten)
+        self.arch = arch # 'trans_enc', 'trans_dec', or 'gru'
         # self.gru_emb_dim = self.latent_dim if self.arch == 'gru' else 0
         # self.input_process = InputProcess(self.data_rep, self.input_feats+self.gru_emb_dim, self.latent_dim)
         self.input_process = InputProcess(self.data_rep, self.input_feats + (self.keyframe_cond_type != ''), self.latent_dim)
@@ -201,13 +203,17 @@ class MDM(nn.Module):
         bs, njoints, nfeats, nframes = x.shape
         time_emb = self.embed_timestep(timesteps)  # [1, bs, d]
 
+        # Always start memory embedding from time_emb so we have a valid `emb`
+        # even when there is no text/audio/action conditioning.
+        emb = time_emb # [1, 64, 512]
+
         if 'target_cond' in y.keys():  
             # time_emb += self.mask_cond(self.embed_target_cond(y['target_cond'], y['target_joint_names'], y['is_heading'])[None], force_mask=y.get('target_uncond', False))  # For uncond support and CFG
             time_emb += self.embed_target_cond(y['target_cond'], y['target_joint_names'], y['is_heading'])[None]  # We don't use CFG for joints!
-
+        
         # Build input for prefix completion
         if self.is_prefix_comp:
-            x = torch.cat([y['prefix'], x], dim=-1)
+            x = torch.cat([y['prefix'], x], dim=-1) # [bs, 263, 1, context_len+pred_pen]
             y['mask'] = torch.cat([torch.ones([bs, 1, 1, self.context_len], dtype=y['mask'].dtype, device=y['mask'].device), 
                                    y['mask']], dim=-1)
 
@@ -221,7 +227,7 @@ class MDM(nn.Module):
             keyframes_ch = y['keyframe_mask'].to(x.dtype) *2. -1.
             x = torch.cat([x, keyframes_ch], dim=1)   # [batch_size, njoints+1, nfeats, max_frames]
 
-        force_mask = y.get('text_uncond', False)
+        force_mask = y.get('text_uncond', False) # not to attend to text tooken , set via CLI args --text_uncond_all
         if 'text' in self.cond_mode:
             if 'text_embed' in y.keys():  # caching option
                 enc_text = y['text_embed']
@@ -241,9 +247,28 @@ class MDM(nn.Module):
                 emb = torch.cat([time_emb, text_emb], dim=0)
                 if 'text_embed' not in y.keys():
                     text_mask = torch.cat([torch.zeros_like(text_mask[:, 0:1]), text_mask], dim=1)
+        #print('[DEBUG] (2) emb.shape = ', emb.shape) # [time_emb, text_emb] , shape = [2, bs, 512]
         if 'action' in self.cond_mode:
             action_emb = self.embed_action(y['action'])
             emb += self.mask_cond(action_emb, force_mask=force_mask)
+
+        # ==== per-frame audio cross-attention tokens ===============================
+        # We inject audio as memory tokens for the Transformer decoder instead of concat with motion
+        # We assume y["audio_embed_pred"]: [bs, F_audio, T_pred]
+        # where F_audio == self.clip_dim when text_encoder_type == "none".
+        if y is not None and "audio_embed_pred" in y and self.per_frame_audio_xatten:
+            #print('Add Per-frame audio into contidioning sequence')
+            audio = torch.cat([y["audio_embed_prefix"],y["audio_embed_pred"]], dim=-1)  # [bs, F_audio, T]
+            # reshape to [T, bs, F_audio] so each time-step is a token
+            audio = audio.permute(2, 0, 1)  # [T, bs, F_audio]
+            # reuse embed_text: R^{F_audio} -> R^{latent_dim} to map audio features
+            # into the same latent space as text / time embeddings.
+            audio_emb = self.embed_text(audio)  # [T, bs, latent_dim]
+            audio_emb = self.sequence_pos_encoder(audio_emb) # per-frame audio need positional encoding as well
+            # append the audio tokens to the memory sequence so that the
+            # TransformerDecoder can attend to both global cond (time/text/action)
+            # and per-frame audio.
+            emb = torch.cat([emb, audio_emb], dim=0) #[T+2, bs, latent_dim]
 
         if self.arch == 'gru':
             x_reshaped = x.reshape(bs, njoints*nfeats, 1, nframes)
@@ -253,38 +278,45 @@ class MDM(nn.Module):
             x = torch.cat((x_reshaped, emb_gru), axis=1)  #[bs, d+joints*feat, 1, #frames]
 
         x = self.input_process(x)
-
+        
         # TODO - move to collate
         frames_mask = None
         is_valid_mask = y['mask'].shape[-1] > 1  # Don't use mask with the generate script
         if self.mask_frames and is_valid_mask:
             frames_mask = torch.logical_not(y['mask'][..., :x.shape[0]].squeeze(1).squeeze(1)).to(device=x.device)
-            if self.emb_trans_dec or self.arch == 'trans_enc':
-                step_mask = torch.zeros((bs, 1), dtype=torch.bool, device=x.device)
-                frames_mask = torch.cat([step_mask, frames_mask], dim=1)
+            if self.emb_trans_dec or self.arch == 'trans_enc': # prepend condition to x_seq
+                cond_len = emb.shape[0]
+                cond_mask = torch.zeros((bs, cond_len), dtype=torch.bool, device=x.device)
+                frames_mask = torch.cat([cond_mask, frames_mask], dim=1)
 
         if self.arch == 'trans_enc':
             # adding the timestep embed
-            xseq = torch.cat((emb, x), axis=0)  # [seqlen+1, bs, d]
+            xseq = torch.cat((emb, x), axis=0)  # [seqlen+1, bs, d] 
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
-            output = self.seqTransEncoder(xseq, src_key_padding_mask=frames_mask)[1:]  # , src_key_padding_mask=~maskseq)  # [seqlen, bs, d]
+            cond_len = emb.shape[0]
+            output = self.seqTransEncoder(xseq, src_key_padding_mask=frames_mask)[cond_len:]  # drop cond tokens
 
         elif self.arch == 'trans_dec':
-            if self.emb_trans_dec:
+            if self.emb_trans_dec: # not recommended to prepend emb in x_seq
                 xseq = torch.cat((time_emb, x), axis=0)
             else:
                 xseq = x
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
+            #print("[DEBUG] xseq AFTER pos_enc shape =", xseq.shape)
+            #if frames_mask is not None: print("[DEBUG] frame_mask.shape = ", frames_mask.shape)
+            #print("[DEBUG] emb.shape = ", emb.shape)
 
             if self.text_encoder_type == 'clip' or self.text_encoder_type == 'none':
                 output = self.seqTransDecoder(tgt=xseq, memory=emb, tgt_key_padding_mask=frames_mask)
+                #print("[DEBUG] decoder raw output shape =", output.shape)
             elif self.text_encoder_type == 'bert':
-                output = self.seqTransDecoder(tgt=xseq, memory=emb, memory_key_padding_mask=text_mask, tgt_key_padding_mask=frames_mask)  # Rotem's bug fix
+                output = self.seqTransDecoder(tgt=xseq, memory=emb, memory_key_padding_mask=text_mask, tgt_key_padding_mask=frames_mask)
             else:
                 raise ValueError()
 
-            if self.emb_trans_dec:
-                output = output[1:] # [seqlen, bs, d]
+            if self.emb_trans_dec: # not recommended to prepend emb in x_seq 基本上不該進這邊
+                cond_len = emb.shape[0]
+                output = output[cond_len:] # [seqlen, bs, d]
 
         elif self.arch == 'gru':
             xseq = x
@@ -294,9 +326,11 @@ class MDM(nn.Module):
         # Extract completed suffix
         if self.is_prefix_comp:
             output = output[self.context_len:]
+            #print("[DEBUG] decoder output after removing prefix context =", output.shape)
             y['mask'] = y['mask'][..., self.context_len:]
         
         output = self.output_process(output)  # [bs, njoints, nfeats, nframes]
+        #print("[DEBUG] final mdm output shape =", output.shape)
         return output
 
 

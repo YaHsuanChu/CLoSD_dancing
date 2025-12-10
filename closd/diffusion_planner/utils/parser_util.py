@@ -145,7 +145,7 @@ def add_model_options(parser):
                        help="Per-frame audio feature dimension when using concat mode (e.g., AIST++ audio_feats).")
     group.add_argument("--audio_concat_mode", default='none', choices=['none', 'concat'], type=str,
                        help="If 'concat', will concatenate per-frame audio features to motion along the channel dimension.")
-
+    group.add_argument("--per_frame_audio_xatten", action='store_true', help="Use per-frame audio tokens as cross-attention memory (instead of channel concat).")
 
     # Prefix completion model
     group.add_argument("--context_len", default=0, type=int, help="If larger than 0, will do prefix completion.")

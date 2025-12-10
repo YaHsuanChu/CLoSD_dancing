@@ -1375,7 +1375,6 @@ class GaussianDiffusion:
         mask = model_kwargs['y']['mask']
         if 'keyframe_mask' in model_kwargs['y'].keys():
             mask = torch.logical_and(mask, ~model_kwargs['y']['keyframe_mask'])  # exclude keyframes from loss
-
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
@@ -1396,7 +1395,7 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            # 家��块�Jご�哀咕悛� x_t�][motion+audio]�^�A�� loss 度�b motion channel �W璸衡
+            # Here x_t may contain [motion+audio], but the loss will be computed only on motion channels
             model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
@@ -1441,7 +1440,7 @@ class GaussianDiffusion:
             if model_kwargs is not None and isinstance(model_kwargs, dict) and 'y' in model_kwargs:
                 y_kwargs = model_kwargs['y']
                 if isinstance(y_kwargs, dict) and 'audio_embed_pred' in y_kwargs:
-                    mode = y_kwargs.get('audio_concat_mode', 'concat')
+                    mode = y_kwargs.get('audio_concat_mode', 'none')
                     if mode == 'concat':
                         audio_concat = True
 
@@ -1508,7 +1507,9 @@ class GaussianDiffusion:
             if self.lambda_target_loc > 0.:
                 assert self.model_mean_type == ModelMeanType.START_X, 'This feature supports only X_start pred for now!'
                 ref_target = model_kwargs['y']['target_cond']
-                pred_target = get_target_location(model_output, dataset.mean_gpu, dataset.std_gpu, 
+                # 若啟用了 audio concat，model_output 的 channel 會比 motion 維度大（多出 audio dim）。
+                # target_loc loss 只關心純 motion，所以沿用上面裁切過的 model_output_motion。
+                pred_target = get_target_location(model_output_motion, dataset.mean_gpu, dataset.std_gpu, 
                                             model_kwargs['y']['lengths'], dataset.t2m_dataset.opt.joints_num, model.all_goal_joint_names, 
                                             model_kwargs['y']['target_joint_names'], model_kwargs['y']['is_heading'])
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
