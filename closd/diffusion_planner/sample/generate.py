@@ -128,6 +128,33 @@ def main(args=None):
         _, model_kwargs = collate(collate_args)
 
     model_kwargs['y'] = {key: val.to(dist_util.dev()) if torch.is_tensor(val) else val for key, val in model_kwargs['y'].items()}
+
+
+    # --- 若啟用 concat 模式，讓 prefix 的 channel 也包含 audio，與訓練時保持一致 ---
+    if getattr(args, 'audio_concat_mode', 'none') == 'concat':
+        y = model_kwargs['y']
+        audio_prefix = y.get('audio_embed_prefix', None)  # (B, F_audio, T_prefix)
+
+        if 'prefix' in y and audio_prefix is not None:
+            prefix_motion = y['prefix']  # (B, D_motion, 1, T_prefix)
+            T_prefix = prefix_motion.shape[-1]
+
+            # (B, F_audio, T_prefix) -> (B, T_prefix, F_audio)
+            audio_prefix_tf = audio_prefix.permute(0, 2, 1)
+            Bp, T_ap, F_ap = audio_prefix_tf.shape
+            # 通常 T_ap == T_prefix；保險起見仍做一次對齊
+            if T_ap >= T_prefix:
+                audio_pref_trim = audio_prefix_tf[:, :T_prefix, :]
+            else:
+                pad_len = T_prefix - T_ap
+                pad = torch.zeros(Bp, pad_len, F_ap, device=audio_prefix.device, dtype=audio_prefix.dtype)
+                audio_pref_trim = torch.cat([audio_prefix_tf, pad], dim=1)
+
+            audio_feat_prefix = audio_pref_trim.permute(0, 2, 1).unsqueeze(2)  # (B, F_audio, 1, T_prefix)
+
+            # 將 audio prefix concat 進 prefix motion，使其與模型的 x channel 維度一致（263 + F_audio）
+            y['prefix'] = torch.cat([prefix_motion, audio_feat_prefix], dim=1)
+
     init_image = None
     if args.spatial_condition is not None:
         if args.spatial_condition == 'traj':
