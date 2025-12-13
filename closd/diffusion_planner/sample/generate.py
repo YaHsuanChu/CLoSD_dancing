@@ -35,6 +35,7 @@ def main(args=None):
     max_frames = 196 if args.dataset in ['kit', 'humanml', 'aistpp'] else 60
     fps = 12.5 if args.dataset == 'kit' else 20
     n_frames = min(max_frames, int(args.motion_length*fps)) if args.motion_length is not None else max_frames
+    print('[DEBUG] n_frames = ', n_frames)
     cfg_type = args.__dict__.get('cfg_type', 'text')
     if args.pred_len > 0 and not args.autoregressive:
         n_frames = args.pred_len
@@ -109,6 +110,7 @@ def main(args=None):
     if is_using_data:
         iterator = iter(data)
         input_motion, model_kwargs = next(iterator)
+        print('[DEBUG] input_motion.shape = ', input_motion.shape)
         input_motion = input_motion.to(dist_util.dev())
         if 'prefix' in model_kwargs['y'].keys():
             input_motion_w_prefix = torch.concat([model_kwargs['y']['prefix'].to(dist_util.dev()), input_motion], dim=3); 
@@ -187,7 +189,8 @@ def main(args=None):
         if 'text' in model_kwargs['y'].keys() and getattr(model, 'text_encoder_type', 'clip') != 'none':
             # encoding once instead of each iteration saves lots of time
             model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
-
+        print("model_kwargs['y']['audio_embed_prefix'].shape = ", model_kwargs['y']['audio_embed_prefix'].shape)
+        print("model_kwargs['y']['audio_embed_pred'].shape = ", model_kwargs['y']['audio_embed_pred'].shape)
         sample = sample_fn(
             model,
             motion_shape,
@@ -370,7 +373,9 @@ def load_dataset(args, max_frames, n_frames):
                               split='test',
                               hml_mode='train' if args.pred_len > 0 else 'text_only',
                               hml_type=args.hml_type,
-                              fixed_len=args.pred_len + args.context_len, pred_len=args.pred_len, device=dist_util.dev())
+                              #fixed_len=args.pred_len + args.context_len, pred_len=args.pred_len, 
+                              pred_len=max_frames, fixed_len=max_frames+args.context_len, #TODO
+                              device=dist_util.dev())
     data.fixed_length = n_frames
     return data
 

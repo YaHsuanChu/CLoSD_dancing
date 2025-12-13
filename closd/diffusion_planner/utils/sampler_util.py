@@ -43,6 +43,7 @@ class AutoRegressiveSampler():
     
     def sample(self, model, shape, **kargs):
         bs = shape[0]
+        print('[DEBUG] AutoregressiveSampler shape = ', shape)
         n_iterations = (self.required_frames // self.args.pred_len) + 1
         samples_buf = []
         cur_prefix = deepcopy(kargs['model_kwargs']['y']['prefix'])  # init with data
@@ -50,10 +51,47 @@ class AutoRegressiveSampler():
             samples_buf.append(cur_prefix)
         autoregressive_shape = list(deepcopy(shape))
         autoregressive_shape[-1] = self.args.pred_len
-        for _ in range(n_iterations):
+        print('[DEBUG] autoregressive_shape = ', autoregressive_shape)
+
+        # If audio cross-attention is enabled, keep a full audio timeline so we can
+        # feed sliding windows that align with each generated chunk.
+        audio_prefix = kargs['model_kwargs']['y'].get('audio_embed_prefix')
+        audio_pred = kargs['model_kwargs']['y'].get('audio_embed_pred')
+        full_audio = None
+        if audio_prefix is not None or audio_pred is not None:
+            if audio_prefix is not None and audio_pred is not None:
+                full_audio = torch.cat([audio_prefix, audio_pred], dim=2)
+            elif audio_pred is not None:
+                full_audio = audio_pred
+        print('full_audio.shape = ', full_audio.shape)
+
+        def slice_audio_with_pad(audio, start_t, length):
+            """Return audio[:, :, start_t:start_t+length] padding with zeros if short."""
+            B, F, T = audio.shape
+            if start_t >= T:
+                return torch.zeros(B, F, length, device=audio.device, dtype=audio.dtype)
+            end_t = start_t + length
+            audio_slice = audio[:, :, start_t:end_t]
+            if audio_slice.shape[2] < length:
+                pad = torch.zeros(B, F, length - audio_slice.shape[2],
+                                  device=audio.device, dtype=audio.dtype)
+                audio_slice = torch.cat([audio_slice, pad], dim=2)
+            return audio_slice
+
+        for step in range(n_iterations):
             cur_kargs = deepcopy(kargs)
             cur_kargs['model_kwargs']['y']['prefix'] = cur_prefix
+            if full_audio is not None:
+                # Align audio windows with the current time offset. We stride by pred_len.
+                time_offset = step * self.args.pred_len
+                cur_kargs['model_kwargs']['y']['audio_embed_prefix'] = slice_audio_with_pad(
+                    full_audio, time_offset, self.args.context_len)
+                cur_kargs['model_kwargs']['y']['audio_embed_pred'] = slice_audio_with_pad(
+                    full_audio, time_offset + self.args.context_len, self.args.pred_len)
+            #print("cur_kargs['model_kwargs']['y']['audio_embed_prefix'].shape = ", cur_kargs['model_kwargs']['y']['audio_embed_prefix'].shape)
+            #print("cur_kargs['model_kwargs']['y']['audio_embed_pred'].shape = ", cur_kargs['model_kwargs']['y']['audio_embed_pred'].shape)
             sample = self.sample_fn(model, autoregressive_shape, **cur_kargs)
+            #print('sample.shape = ', sample.shape)
             samples_buf.append(sample.clone()[..., -self.args.pred_len:])
             cur_prefix = sample.clone()[..., -self.args.context_len:]  # update
 
