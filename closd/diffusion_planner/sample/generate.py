@@ -32,7 +32,7 @@ def main(args=None):
     n_joints = 22 if args.dataset in ['humanml', 'aistpp'] else 21
     name = os.path.basename(os.path.dirname(args.model_path))
     niter = os.path.basename(args.model_path).replace('model', '').replace('.pt', '')
-    max_frames = 196 if args.dataset in ['kit', 'humanml'] else 60
+    max_frames = 196 if args.dataset in ['kit', 'humanml', 'aistpp'] else 60
     fps = 12.5 if args.dataset == 'kit' else 20
     n_frames = min(max_frames, int(args.motion_length*fps)) if args.motion_length is not None else max_frames
     cfg_type = args.__dict__.get('cfg_type', 'text')
