@@ -1,7 +1,7 @@
 *.zip
 *isaacgym/
 *.json
-
+aist_plusplus_processed/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

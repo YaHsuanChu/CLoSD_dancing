@@ -105,7 +105,7 @@ class MDM(nn.Module):
             raise ValueError('Please choose correct architecture [trans_enc, trans_dec, gru]')
 
         self.embed_timestep = TimestepEmbedder(self.latent_dim, self.sequence_pos_encoder)
-
+        print('self.cond_mode = ', self.cond_mode)
         if self.cond_mode != 'no_cond':
             if 'text' in self.cond_mode:
                 # We support CLIP encoder and DistilBERT
@@ -207,7 +207,8 @@ class MDM(nn.Module):
         # even when there is no text/audio/action conditioning.
         emb = time_emb # [1, 64, 512]
 
-        if 'target_cond' in y.keys():  
+        if 'target_cond' in y.keys(): 
+            raise ValueError('We do not support target joint condition in aistpp dataset for now')
             # time_emb += self.mask_cond(self.embed_target_cond(y['target_cond'], y['target_joint_names'], y['is_heading'])[None], force_mask=y.get('target_uncond', False))  # For uncond support and CFG
             time_emb += self.embed_target_cond(y['target_cond'], y['target_joint_names'], y['is_heading'])[None]  # We don't use CFG for joints!
         
@@ -247,7 +248,7 @@ class MDM(nn.Module):
                 emb = torch.cat([time_emb, text_emb], dim=0)
                 if 'text_embed' not in y.keys():
                     text_mask = torch.cat([torch.zeros_like(text_mask[:, 0:1]), text_mask], dim=1)
-        #print('[DEBUG] (2) emb.shape = ', emb.shape) # [time_emb, text_emb] , shape = [2, bs, 512]
+        #print('[DEBUG] (1) emb.shape = ', emb.shape) # [time_emb, text_emb] , shape = [2, bs, 512]
         if 'action' in self.cond_mode:
             action_emb = self.embed_action(y['action'])
             emb += self.mask_cond(action_emb, force_mask=force_mask)
@@ -257,7 +258,7 @@ class MDM(nn.Module):
         # We assume y["audio_embed_pred"]: [bs, F_audio, T_pred]
         # where F_audio == self.clip_dim when text_encoder_type == "none".
         if y is not None and "audio_embed_pred" in y and self.per_frame_audio_xatten:
-            #print('Add Per-frame audio into contidioning sequence')
+            #print('[DEBUG] Add Per-frame audio into contidioning sequence')
             audio = torch.cat([y["audio_embed_prefix"],y["audio_embed_pred"]], dim=-1)  # [bs, F_audio, T]
             # reshape to [T, bs, F_audio] so each time-step is a token
             audio = audio.permute(2, 0, 1)  # [T, bs, F_audio]
@@ -269,6 +270,7 @@ class MDM(nn.Module):
             # TransformerDecoder can attend to both global cond (time/text/action)
             # and per-frame audio.
             emb = torch.cat([emb, audio_emb], dim=0) #[T+2, bs, latent_dim]
+            #print('[DEBUG] (2) emb.shape = ', emb.shape) # [time_emb, text_emb] , shape = [2, bs, 512]
 
         if self.arch == 'gru':
             x_reshaped = x.reshape(bs, njoints*nfeats, 1, nframes)
@@ -288,6 +290,7 @@ class MDM(nn.Module):
                 cond_len = emb.shape[0]
                 cond_mask = torch.zeros((bs, cond_len), dtype=torch.bool, device=x.device)
                 frames_mask = torch.cat([cond_mask, frames_mask], dim=1)
+        if frames_mask is not None: print('[DEBUG] frames_mask.shape = ', frames_mask.shape)
 
         if self.arch == 'trans_enc':
             # adding the timestep embed
@@ -304,7 +307,7 @@ class MDM(nn.Module):
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
             #print("[DEBUG] xseq AFTER pos_enc shape =", xseq.shape)
             #if frames_mask is not None: print("[DEBUG] frame_mask.shape = ", frames_mask.shape)
-            #print("[DEBUG] emb.shape = ", emb.shape)
+            #print("[DEBUG] (3) emb.shape = ", emb.shape)
 
             if self.text_encoder_type == 'clip' or self.text_encoder_type == 'none':
                 output = self.seqTransDecoder(tgt=xseq, memory=emb, tgt_key_padding_mask=frames_mask)
