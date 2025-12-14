@@ -213,40 +213,34 @@ python -m closd.diffusion_planner.train.train_mdm \
 
 
 ### 4. Sampling 範例（生成音訊條件動作）
-
-假設你已經用上面的設定訓練好一個 AIST++ 模型，checkpoint 存在：
-
-- 模式 A：`--save_dir output/CLoSD/CLoSD_aistpp_concat_only`
-- 模式 B：`--save_dir output/diffusion/aistpp_per_frame_cross_attn_only_ng20`
-
-可以使用 `sample/generate.py` 進行條件生成，例如（模式 A 範例）：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m closd.diffusion_planner.sample.generate \
-   --model_path output/CLoSD/CLoSD_aistpp_concat_only/model200000.pt \
-   --save_dir output/CLoSD/CLoSD_aistpp_concat_only/samples \
-   --dataset aistpp \
-   --text_encoder_type none \
-   --audio_concat_mode concat \
-   --audio_dim 80 \
-   --audio_feat_dim 80 \
-   --batch_size 16 \
-   --num_samples 64 \
-   --context_len 20 \
-   --pred_len 40
+Run the following command to generate samples with `generate.py`
+**generate command (xatten)**
+```
+python -m closd.diffusion_planner.sample.generate \
+    --model_path output/diffusion/aistpp_per_frame_cross_attn_only_ng40/model000200000.pt \
+    --output_dir output/diffusion/aistpp_per_frame_cross_attn_only_ng40/samples/ \
+    --dataset aistpp \
+    --text_encoder_type none --audio_concat_mode none --text_uncond_all \
+    --per_frame_audio_xatten \
+    --arch trans_dec \
+    --audio_dim 80 --audio_feat_dim 80 \
+    --context_len 20 --pred_len 40 \
+    --autoregressive --motion_length 9.8 \
+    --num_samples 8 --device 0
 ```
 
-關鍵說明：
-
-- `--dataset aistpp`：會啟用 AIST++ 的 data loader，從 `data/aistpp/audio_feats` 載入對應音檔的特徵，並自動時間對齊到 motion 長度。
-- `--text_encoder_type none`：與訓練時一致，表示不另外跑 CLIP/BERT，只使用 `y['text_embed']` 中的 pooled audio 作為 text-cond 介面。
-- `--audio_concat_mode concat` + `--audio_dim/--audio_feat_dim`：需與訓練時完全一致，否則模型輸入維度會不對齊。（模式 B 則改為 `audio_concat_mode none`，並加上 `--per_frame_audio_xatten`。）
-- `--context_len` / `--pred_len`：需與訓練時保持相同（例如 20 / 40），特別是 prefix-completion 模式下，這兩個值會決定 prefix 與生成區間的長度。
-
-在 `generate.py` 內部，若偵測到 `audio_concat_mode='concat'` 且 channel 數大於 motion_dim（humanml/aistpp 預設為 263），會在輸出後自動截掉多出來的 audio channel，只保留前 263 維作為動作特徵，方便後續還原/視覺化。
-
-
-
+**generate command (concat)**
+```
+python -m closd.diffusion_planner.sample.generate \
+    --model_path output/diffusion/aistpp_concat_ng40/model000200000.pt \
+    --output_dir output/diffusion/aistpp_concat_ng40/samples/ \
+    --dataset aistpp \
+    --text_encoder_type none --audio_concat_mode concat --text_uncond_all \
+    --audio_dim 80 --audio_feat_dim 80 \
+    --context_len 20 --pred_len 40 \
+    --autoregressive --motion_length 9.8 \
+    --num_samples 8 --device 0
+```
 
 ## 中文補充：AIST++ 的 audio concat / cross-attention 模式
 
