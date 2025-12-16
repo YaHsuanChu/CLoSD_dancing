@@ -2,7 +2,7 @@
 name=aistpp
 
 # Frame rate and lengths
-fps=20
+fps=60
 max_motion_frames=2877
 min_motion_frames=20
 
@@ -17,6 +17,8 @@ dim_pose=263
 motion_dir=data/aistpp/motions
 # Generate audio features (.npy) into this folder
 audio_dir=data/aistpp/audio_feats
+# Original wav files (optional) for raw audio retrieval
+audio_wav_dir=data/aistpp/audio
 
 # Normalization stats (compute from the above dirs)
 motion_mean_path=dataset/aistpp_motion_mean_raw.npy

@@ -26,7 +26,7 @@ Setup steps
        --representation raw`
    This writes `aistpp_motion_mean.npy` and `aistpp_motion_std.npy`.
 
-4) Edit `closd/diffusion_planner/dataset/aistpp_opt.txt` if needed to match final paths.
+4) Edit `closd/diffusion_planner/dataset/aistpp_opt.txt` if needed to match final paths. Besides `motion_dir` / `audio_dir`, set `audio_wav_dir` to the folder containing the original `.wav` files so the loader can slice raw audio segments on the fly (used later for video export).
 
 Training
 - Use dataset `aistpp` and disable text encoder (audio only):
@@ -41,7 +41,7 @@ Data Access & Batch Structure
 The underlying per-sample tuple (before collation) returned by `AISTPPMotionAudioDataset.__getitem__` is:
 
 ```
-(audio_embeddings, dummy_pos, caption_placeholder, audio_token_len, motion, motion_len, audio_tokens_joined)
+(audio_embeddings, dummy_pos, caption_placeholder, audio_token_len, motion, motion_len, audio_tokens_joined, raw_audio_dict)
 ```
 
 Field meanings:
@@ -52,6 +52,7 @@ Field meanings:
 - `motion`: raw or HumanML-converted motion features shape `(T_motion, D_motion)`. If `remap_joints=true` then `D_motion=263` (HumanML feature dim). Otherwise `D_motion = n_joints*3` flattened.
 - `motion_len`: original (pre-padding/cropping) motion length in frames.
 - `audio_tokens_joined`: joined token string e.g. `a0_a1_...`; used downstream as a surrogate tokens field.
+- `raw_audio_dict`: metadata for the aligned wav slice; contains `{'waveform': np.array(float32, mono), 'sample_rate': int, 'path': str, 'start_frame': int, 'num_frames': int, ...}`. This is optional (None if the wav is missing).
 
 Collated batch (after `t2m_collate` / `t2m_prefix_collate` in `data_loaders/tensors.py`) produces:
 
@@ -66,6 +67,7 @@ cond['y'] keys:
    audio_embed_prefix: (B, F_audio, context_len)      
    audio_embed_pred:   (B, F_audio, pred_len)      
    text_embed:         (1, B, F_audio)                # pooled global audio vector from pred window
+   audio:              list[dict]                     # raw audio metadata per sample (see below)
    db_key:             list (None placeholders unless return_keys enabled)
 ```
 
@@ -91,6 +93,20 @@ audio_pred   = cond['y']['audio_embed_pred']    # (B, F_audio, pred_len)
 text_embed   = cond['y']['text_embed']          # (1, B, F_audio)
 motion_prefix = cond['y']['prefix']             # (B, D_motion, 1, context_len)
 ```
+
+Raw audio access (for movie export)
+```python
+from moviepy.audio.AudioClip import AudioArrayClip
+
+motion, cond = next(iter(loader))
+audio_meta = cond['y']['audio'][0]
+waveform = audio_meta['waveform'].cpu().numpy()  # (samples,)
+sr = int(audio_meta['sample_rate'])
+audio_clip = AudioArrayClip(waveform[:, None], fps=sr)
+video_clip = frame_clip.set_audio(audio_clip)
+video_clip.write_videofile('sample.mp4', fps=60)
+```
+Every sample’s `audio_meta` dict includes the source wav path plus the motion-aligned time window (`start_frame`, `num_frames`, `start_time`, `end_time`), which makes debugging or exporting synchronized clips straightforward.
 
 
 ## 中文補充：AIST++ 的 audio concat / cross-attention 模式

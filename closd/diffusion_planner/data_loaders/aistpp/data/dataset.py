@@ -4,13 +4,15 @@ import numpy as np
 import torch
 from torch.utils import data
 from os.path import join as pjoin
+from moviepy.editor import AudioFileClip
 from closd.diffusion_planner.data_loaders.aistpp.utils.get_opt import get_opt
 from closd.diffusion_planner.data_loaders.humanml.scripts.motion_process_torch import extract_features_t2m
 
 class AISTPPMotionAudioDataset(data.Dataset):
     """Audio->Motion dataset for AIST++ aligned with HumanML3D tuple interface.
 
-    Returns tuple: (audio_embeddings, dummy_pos, caption_placeholder, audio_token_len, motion, motion_len, audio_tokens_joined[, key])
+    Returns tuple: (audio_embeddings, dummy_pos, caption_placeholder, audio_token_len,
+    motion, motion_len, audio_tokens_joined, raw_audio_dict[, key])
     so that existing t2m_collate can operate with minimal change.
     - audio_embeddings: (N_tokens, F) float32
     - dummy_pos: zeros (N_tokens, 1)
@@ -19,6 +21,7 @@ class AISTPPMotionAudioDataset(data.Dataset):
     - motion: (T, D) normalized
     - motion_len: int (original length before padding)
     - audio_tokens_joined: string e.g. 'a0_a1_...'
+    - raw_audio_dict: {'waveform': np.ndarray, 'sample_rate': int, 'path': str, ...}
     """
     def __init__(self, opt, split='train', device=None):
         self.opt = opt
@@ -37,6 +40,9 @@ class AISTPPMotionAudioDataset(data.Dataset):
         if len(self.pairs) == 0:
             raise RuntimeError(f"No motion/audio pairs found in {opt.motion_dir} and {opt.audio_dir}")
 
+        self.audio_wav_map = self._build_wav_lookup(opt.audio_wav_dir)
+        self.dataset_fps = float(getattr(self.opt, 'fps', 60.0)) if getattr(self.opt, 'fps', None) is not None else 60.0
+
         # infer dim_pose from first motion
         sample_motion = np.load(self.pairs[0][0])
         if sample_motion.ndim == 3:  # (T, J, C)
@@ -46,10 +52,12 @@ class AISTPPMotionAudioDataset(data.Dataset):
         # else keep flattened dimension.
         self.opt.dim_pose = 263 if self.opt.remap_joints else sample_motion.shape[1]
 
-    def _gather_files(self, root):
+    def _gather_files(self, root, suffix=('.npy',)):
         if not os.path.isdir(root):
             return []
-        return sorted([pjoin(root, f) for f in os.listdir(root) if f.endswith('.npy')])
+        if isinstance(suffix, str):
+            suffix = (suffix,)
+        return sorted([pjoin(root, f) for f in os.listdir(root) if f.endswith(suffix)])
 
     def _match_pairs(self, motion_files, audio_files):
         audio_map = {os.path.basename(f).replace('.npy', ''): f for f in audio_files}
@@ -59,6 +67,16 @@ class AISTPPMotionAudioDataset(data.Dataset):
             if base in audio_map:
                 pairs.append((m, audio_map[base]))
         return pairs
+
+    def _build_wav_lookup(self, root):
+        if root is None or root == '' or not os.path.isdir(root):
+            return {}
+        lookup = {}
+        for dirpath, _, filenames in os.walk(root):
+            for f in filenames:
+                if f.lower().endswith('.wav'):
+                    lookup[os.path.splitext(f)[0]] = os.path.join(dirpath, f)
+        return lookup
 
     def __len__(self):
         return len(self.pairs)
@@ -102,6 +120,7 @@ class AISTPPMotionAudioDataset(data.Dataset):
 
     def __getitem__(self, idx):
         motion_path, audio_path = self.pairs[idx]
+        base = os.path.splitext(os.path.basename(motion_path))[0]
         motion = self._load_motion(motion_path)
         # optional conversion to HumanML feature representation
         if self.opt.remap_joints:
@@ -151,12 +170,66 @@ class AISTPPMotionAudioDataset(data.Dataset):
         dummy_pos = np.zeros((token_len, 1), dtype=np.float32)
         caption_placeholder = ''
         tokens_joined = '_'.join(audio_tokens)
-        ret = (audio_embeddings, dummy_pos, caption_placeholder, token_len, motion, m_length, tokens_joined)
+        segment_frames = min(orig_len - start, self.opt.max_motion_length)
+        pad_frames = max(0, self.opt.max_motion_length - segment_frames)
+        raw_audio_dict = self._load_raw_audio_segment(base, start, segment_frames, pad_frames)
+        ret = (audio_embeddings, dummy_pos, caption_placeholder, token_len, motion, m_length, tokens_joined, raw_audio_dict)
         # debug dimemsion checks print
         # print(f'[DEBUG] Loaded idx={idx}: motion {motion.shape}, audio {audio_embeddings.shape}')
         
         return ret
 
+    def _load_raw_audio_segment(self, basename, start_frame, segment_frames, pad_frames):
+        if segment_frames <= 0 or basename not in self.audio_wav_map:
+            return None
+        wav_path = self.audio_wav_map.get(basename)
+        if wav_path is None:
+            return None
+        fps = self.dataset_fps if self.dataset_fps > 0 else 60.0
+        start_time = max(0.0, start_frame / fps)
+        duration = segment_frames / fps
+        end_time = start_time + duration
+        target_sr = None
+        try:
+            with AudioFileClip(wav_path) as clip:
+                clip_duration = getattr(clip, 'duration', None)
+                if clip_duration is not None:
+                    end_time = min(end_time, clip_duration)
+                if end_time <= start_time:
+                    return None
+                subclip = clip.subclip(start_time, end_time)
+                try:
+                    native_sr = getattr(subclip, 'fps', None) or getattr(clip, 'fps', None) or 44100
+                    target_sr = int(native_sr)
+                    waveform = subclip.to_soundarray(fps=target_sr)
+                finally:
+                    subclip.close()
+        except Exception as e:
+            print(f'[WARN] Failed to load raw audio for {basename}: {e}')
+            return None
+
+        if waveform.ndim == 2:
+            waveform = waveform.mean(axis=1)
+        waveform = waveform.astype(np.float32)
+        if pad_frames > 0:
+            pad_samples = int(round((pad_frames / fps) * target_sr))
+            if pad_samples > 0:
+                waveform = np.concatenate([waveform, np.zeros(pad_samples, dtype=np.float32)])
+
+        if waveform.size == 0:
+            return None
+
+        return {
+            'waveform': waveform,
+            'sample_rate': target_sr,
+            'path': wav_path,
+            'start_frame': start_frame,
+            'num_frames': segment_frames,
+            'pad_frames': pad_frames,
+            'start_time': start_time,
+            'end_time': end_time,
+        }
+      
     def inv_transform(self, data):
         """Invert the normalization applied to motion features."""
         if self.motion_mean is None or self.motion_std is None:
@@ -183,7 +256,7 @@ class AISTPP(data.Dataset):
         self.opt = opt
         # Normalize paths to absolute based on abs_base_path
         def _abs(p):
-            if p is None:
+            if not p:
                 return None
             return p if os.path.isabs(p) else pjoin(abs_base_path, p)
         opt.motion_dir = _abs(opt.motion_dir)
@@ -192,6 +265,7 @@ class AISTPP(data.Dataset):
         opt.motion_std_path = _abs(opt.motion_std_path)
         opt.audio_mean_path = _abs(opt.audio_mean_path)
         opt.audio_std_path = _abs(opt.audio_std_path)
+        opt.audio_wav_dir = _abs(getattr(opt, 'audio_wav_dir', None))
         # mean/std already loaded inside dataset per opt file
         self.t2m_dataset = AISTPPMotionAudioDataset(opt, split=split, device=device)
         self.mean_gpu = None

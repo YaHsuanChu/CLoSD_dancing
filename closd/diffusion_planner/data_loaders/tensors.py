@@ -85,6 +85,9 @@ def collate(batch):
     if 'key' in notnone_batches[0]:
         cond['y'].update({'db_key': [b['key'] for b in notnone_batches]})
 
+    if 'audio' in notnone_batches[0]:
+        cond['y'].update({'audio': [b.get('audio') for b in notnone_batches]})
+
     return motion, cond
 
 # an adapter to our collate func
@@ -102,8 +105,12 @@ def t2m_collate(batch, target_batch_size):
             'inp': motion,
             'lengths': b[5],
             'tokens': b[6] if len(b) > 6 else None,
-            'key': b[7] if len(b) > 7 else None,
         }
+        extras = list(b[7:]) if len(b) > 7 else []
+        raw_audio_meta = next((x for x in extras if isinstance(x, dict)), None)
+        key_val = next((x for x in extras if not isinstance(x, dict)), None)
+        if key_val is not None:
+            item['key'] = key_val
         # Decide dataset tuple type by inspecting caption and pos shape
         caption = b[2]
         pos = b[1]
@@ -160,6 +167,13 @@ def t2m_collate(batch, target_batch_size):
                     item['audio_emb_pred'] = torch.tensor(audio_tw.astype(np.float32))
         except Exception:
             pass
+
+        if raw_audio_meta is not None:
+            audio_dict = raw_audio_meta.copy()
+            waveform_np = audio_dict.get('waveform')
+            if waveform_np is not None and not torch.is_tensor(waveform_np):
+                audio_dict['waveform'] = torch.tensor(waveform_np, dtype=torch.float32)
+            item['audio'] = audio_dict
         adapted_batch.append(item)
     return collate(adapted_batch)
 
@@ -174,8 +188,12 @@ def t2m_prefix_collate(batch, pred_len):
             'prefix': full[..., :-pred_len],
             'tokens': b[6] if len(b) > 6 else None,
             'lengths': pred_len,
-            'key': b[7] if len(b) > 7 else None,
         }
+        extras = list(b[7:]) if len(b) > 7 else []
+        raw_audio_meta = next((x for x in extras if isinstance(x, dict)), None)
+        key_val = next((x for x in extras if not isinstance(x, dict)), None)
+        if key_val is not None:
+            item['key'] = key_val
         caption = b[2]
         pos = b[1]
         is_humanml = isinstance(caption, str) and caption != ''
@@ -216,6 +234,13 @@ def t2m_prefix_collate(batch, pred_len):
                         item['audio_emb_prefix'] = torch.tensor(audio_prefix.astype(np.float32))
             except Exception:
                 pass
+
+        if raw_audio_meta is not None:
+            audio_dict = raw_audio_meta.copy()
+            waveform_np = audio_dict.get('waveform')
+            if waveform_np is not None and not torch.is_tensor(waveform_np):
+                audio_dict['waveform'] = torch.tensor(waveform_np, dtype=torch.float32)
+            item['audio'] = audio_dict
         adapted_batch.append(item)
     return collate(adapted_batch)
 
