@@ -28,12 +28,14 @@ def main(args=None):
         args = generate_args()
     fixseed(args.seed)
     out_path = args.output_dir
-    n_joints = 22 if args.dataset == 'humanml' else 21
+    # AIST++ uses the same HumanML3D representation (263-dim -> 22 joints)
+    n_joints = 22 if args.dataset in ['humanml', 'aistpp'] else 21
     name = os.path.basename(os.path.dirname(args.model_path))
     niter = os.path.basename(args.model_path).replace('model', '').replace('.pt', '')
-    max_frames = 196 if args.dataset in ['kit', 'humanml'] else 60
+    max_frames = 196 if args.dataset in ['kit', 'humanml', 'aistpp'] else 60
     fps = 12.5 if args.dataset == 'kit' else 20
     n_frames = min(max_frames, int(args.motion_length*fps)) if args.motion_length is not None else max_frames
+    print('[DEBUG] n_frames = ', n_frames)
     cfg_type = args.__dict__.get('cfg_type', 'text')
     if args.pred_len > 0 and not args.autoregressive:
         n_frames = args.pred_len
@@ -108,6 +110,7 @@ def main(args=None):
     if is_using_data:
         iterator = iter(data)
         input_motion, model_kwargs = next(iterator)
+        print('[DEBUG] input_motion.shape = ', input_motion.shape)
         input_motion = input_motion.to(dist_util.dev())
         if 'prefix' in model_kwargs['y'].keys():
             input_motion_w_prefix = torch.concat([model_kwargs['y']['prefix'].to(dist_util.dev()), input_motion], dim=3); 
@@ -125,6 +128,33 @@ def main(args=None):
         _, model_kwargs = collate(collate_args)
 
     model_kwargs['y'] = {key: val.to(dist_util.dev()) if torch.is_tensor(val) else val for key, val in model_kwargs['y'].items()}
+
+
+    # --- 若啟用 concat 模式，讓 prefix 的 channel 也包含 audio，與訓練時保持一致 ---
+    if getattr(args, 'audio_concat_mode', 'none') == 'concat':
+        y = model_kwargs['y']
+        audio_prefix = y.get('audio_embed_prefix', None)  # (B, F_audio, T_prefix)
+
+        if 'prefix' in y and audio_prefix is not None:
+            prefix_motion = y['prefix']  # (B, D_motion, 1, T_prefix)
+            T_prefix = prefix_motion.shape[-1]
+
+            # (B, F_audio, T_prefix) -> (B, T_prefix, F_audio)
+            audio_prefix_tf = audio_prefix.permute(0, 2, 1)
+            Bp, T_ap, F_ap = audio_prefix_tf.shape
+            # 通常 T_ap == T_prefix；保險起見仍做一次對齊
+            if T_ap >= T_prefix:
+                audio_pref_trim = audio_prefix_tf[:, :T_prefix, :]
+            else:
+                pad_len = T_prefix - T_ap
+                pad = torch.zeros(Bp, pad_len, F_ap, device=audio_prefix.device, dtype=audio_prefix.dtype)
+                audio_pref_trim = torch.cat([audio_prefix_tf, pad], dim=1)
+
+            audio_feat_prefix = audio_pref_trim.permute(0, 2, 1).unsqueeze(2)  # (B, F_audio, 1, T_prefix)
+
+            # 將 audio prefix concat 進 prefix motion，使其與模型的 x channel 維度一致（263 + F_audio）
+            y['prefix'] = torch.cat([prefix_motion, audio_feat_prefix], dim=1)
+
     init_image = None
     if args.spatial_condition is not None:
         if args.spatial_condition == 'traj':
@@ -186,7 +216,8 @@ def main(args=None):
         if 'text' in model_kwargs['y'].keys() and getattr(model, 'text_encoder_type', 'clip') != 'none':
             # encoding once instead of each iteration saves lots of time
             model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
-
+        print("model_kwargs['y']['audio_embed_prefix'].shape = ", model_kwargs['y']['audio_embed_prefix'].shape)
+        print("model_kwargs['y']['audio_embed_pred'].shape = ", model_kwargs['y']['audio_embed_pred'].shape)
         sample = sample_fn(
             model,
             motion_shape,
@@ -202,7 +233,7 @@ def main(args=None):
             cond_fn=cond_fn,
         )
 
-        # �Y�ҥ� concat �Ҧ��B channel �Ƥj��� motion joints�A������ audio channel
+        # When concatenating audio, account for extra channels beyond the motion joints
         if getattr(args, 'audio_concat_mode', 'none') == 'concat':
             if args.dataset in ['humanml', 'aistpp']:
                 motion_dim = 263
@@ -238,9 +269,15 @@ def main(args=None):
 
         if args.unconstrained:
             all_text += ['unconstrained'] * args.num_samples
+        elif 'text' in model_kwargs['y']:
+            all_text += model_kwargs['y']['text']
+        elif 'action_text' in model_kwargs['y']:
+            all_text += model_kwargs['y']['action_text']
+        elif args.dataset == 'aistpp':
+            # AIST++ audio-only sampling has no text/action labels; keep placeholders for filenames
+            all_text += ['audio_cond'] * args.num_samples
         else:
-            text_key = 'text' if 'text' in model_kwargs['y'] else 'action_text'
-            all_text += model_kwargs['y'][text_key]
+            raise KeyError("Expected 'text' or 'action_text' in model_kwargs['y']")
 
         all_motions.append(sample.cpu().numpy())
         _len = model_kwargs['y']['lengths'].cpu().numpy()
@@ -363,7 +400,9 @@ def load_dataset(args, max_frames, n_frames):
                               split='test',
                               hml_mode='train' if args.pred_len > 0 else 'text_only',
                               hml_type=args.hml_type,
-                              fixed_len=args.pred_len + args.context_len, pred_len=args.pred_len, device=dist_util.dev())
+                              #fixed_len=args.pred_len + args.context_len, pred_len=args.pred_len, 
+                              pred_len=max_frames, fixed_len=max_frames+args.context_len, #TODO
+                              device=dist_util.dev())
     data.fixed_length = n_frames
     return data
 
