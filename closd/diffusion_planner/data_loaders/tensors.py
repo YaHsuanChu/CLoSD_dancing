@@ -136,6 +136,8 @@ def t2m_collate(batch, target_batch_size):
             # Treat first element as per-frame audio features; orient to (T,F)
             try:
                 audio_np = np.array(b[0])
+                # FIX audio length
+                audio_np = audio_np[1:]
                 if audio_np.ndim == 2:
                     T_motion = b[5]
                     h, w = audio_np.shape
