@@ -35,6 +35,8 @@ from closd.env.tasks.closd_task import CLoSDTask
 from closd.env.tasks.closd_t2m import CLoSDT2M
 from closd.env.tasks.closd_multitask import CLoSDMultiTask
 from closd.env.tasks.closd_sequence import CLoSDSequence
+# adding new tasks for audio motion generation
+from closd.env.tasks.closd_a2m import CLoSDA2M
 
 from isaacgym import rlgpu
 
