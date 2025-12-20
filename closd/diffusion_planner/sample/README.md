@@ -10,16 +10,11 @@ This folder contains scripts for generating motions using trained diffusion mode
 python -m closd.diffusion_planner.sample.generate_from_audio \
     --model_path <path_to_model.pt> \
     --num_samples 300 \
+    --n_frames 300 \
     --batch_size 32 \
     --output_path <output_folder>
 ```
 
-python -m closd.diffusion_planner.sample.generate_from_audio \
-    --model_path  output/concat_ng40/model000200000.pt\
-    --num_samples 300 \
-    --n_frames 300 \
-    --batch_size 32 \
-    --output_path output/concat_ng40/npy
 
 ### Arguments
 
@@ -27,6 +22,7 @@ python -m closd.diffusion_planner.sample.generate_from_audio \
 |----------|---------|-------------|
 | `--model_path` | (required) | Path to the trained model checkpoint |
 | `--num_samples` | 300 | Number of samples to generate |
+| `--n_frames` | 196 | Number of frames to generate per sample |
 | `--batch_size` | 32 | Batch size for generation |
 | `--output_path` | auto | Output directory (auto-generated if not specified) |
 | `--seed` | 42 | Random seed |
@@ -46,13 +42,13 @@ The generated motions are saved as `generated_motions.npy` in the output directo
 
 ```python
 {
-    "motion": np.ndarray,       # (N, 196, 263) - Generated motions
-    "gt_motion": np.ndarray,    # (N, 196, 263) - Ground truth motions
-    "lengths": np.ndarray,      # (N,) - Motion lengths (all 196)
-    "audio_embed": np.ndarray,  # (N, 80, 196) - Audio embeddings
+    "motion": np.ndarray,       # (N, n_frames, 263) - Generated motions
+    "gt_motion": np.ndarray,    # (N, n_frames, 263) - Ground truth motions
+    "lengths": np.ndarray,      # (N,) - Motion lengths (all n_frames)
+    "audio_embed": np.ndarray,  # (N, 80, n_frames) - Audio embeddings
     "num_samples": int,         # Number of samples
     "context_len": int,         # Context length used (e.g., 20)
-    "pred_len": int,            # Prediction length (196)
+    "pred_len": int,            # Prediction length (n_frames)
     "dataset": str,             # Dataset name
     "model_path": str,          # Model checkpoint path
     "seed": int,                # Random seed used
@@ -68,14 +64,14 @@ import numpy as np
 data = np.load('generated_motions.npy', allow_pickle=True).item()
 
 # Access data
-motions = data['motion']           # (300, 196, 263)
-gt_motions = data['gt_motion']     # (300, 196, 263)
+motions = data['motion']           # (300, n_frames, 263)
+gt_motions = data['gt_motion']     # (300, n_frames, 263)
 lengths = data['lengths']          # (300,)
-audio_embeds = data['audio_embed'] # (300, 80, 196)
+audio_embeds = data['audio_embed'] # (300, 80, n_frames)
 
 # Single sample
-motion_0 = motions[0]              # (196, 263)
-gt_0 = gt_motions[0]               # (196, 263)
+motion_0 = motions[0]              # (n_frames, 263)
+gt_0 = gt_motions[0]               # (n_frames, 263)
 ```
 
 ---
