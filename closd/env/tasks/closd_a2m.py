@@ -50,7 +50,7 @@ class CLoSDA2M(closd_task.CLoSDTask):
                          headless=headless)
         
         self.init_state = STATES.TEXT2MOTION    # same as t2m
-        self.hml_data_buf_size = max(self.fake_mdm_args.context_len, self.planning_horizon_20fps)  # planning_horizon_20fps=_pred_len
+        self.hml_data_buf_size = max(self.fake_mdm_args.context_len, self.planning_horizon_mdm)  # planning_horizon_mdm=_pred_len
         self.hml_prefix_from_data = torch.zeros([self.num_envs, 263, 1, self.hml_data_buf_size], dtype=torch.float32, device=self.device)
         self.audio_embed = None  # store audio embedding info
         self.text_embed = None
@@ -89,7 +89,7 @@ class CLoSDA2M(closd_task.CLoSDTask):
         return torch.zeros([self.num_envs], device=self.device, dtype=bool)
     
     def build_completion_input(self, context_switch_vec=None):
-        # input: hml_poses [n_envs, n_frames@20fps, 263]
+        # input: hml_poses [n_envs, n_frames@mdm_fps, 263]
         # context_switch_vec [n_envs] if not None - indicates which env will use prediction context insted of sim contest
         # output: 
         #   inpainted_motion [bs, 263, 1, max_frames] where hml_poses is the prefix and the rest is zeros
@@ -105,10 +105,10 @@ class CLoSDA2M(closd_task.CLoSDTask):
         
         # pose_context [bs, 30, 24, 3]
         # Real performed motions from the simulator, translated to HML format
-        sim_context, translated_aux_points, recon_data = self.rep.pose_to_hml(pose_context, aux_points, fix_ik_bug=True)  # [bs, n_frames@20fps, 263], [bs, n_points, 3]
+        sim_context, translated_aux_points, recon_data = self.rep.pose_to_hml(pose_context, aux_points, fix_ik_bug=True, src_fps=self.isaac_fps, trg_fps=self.mdm_fps)  # [bs, n_frames@mdm_fps, 263], [bs, n_points, 3]
         
 
-        sim_context = sim_context.unsqueeze(2).permute(0, 3, 2, 1)  # [bs, 263, 1, n_frames@20fps]
+        sim_context = sim_context.unsqueeze(2).permute(0, 3, 2, 1)  # [bs, 263, 1, n_frames@mdm_fps]
 
         if context_switch_vec is not None:
             pred_context = self.cur_mdm_pred[..., -sim_context.shape[-1]:]
@@ -124,9 +124,9 @@ class CLoSDA2M(closd_task.CLoSDTask):
             hml_context = pred_context
         
         # only consider motion representation (263d) in this function
-        motion_tensor_shape = (self.cfg['env']['num_envs'], 263, self.mdm.nfeats, self.max_frame_20fps)
+        motion_tensor_shape = (self.cfg['env']['num_envs'], 263, self.mdm.nfeats, self.max_frame_mdm)
         context_len = hml_context.shape[-1]
-        assert context_len == self.context_len_20fps
+        assert context_len == self.context_len_mdm
         inpainted_motion = torch.zeros(motion_tensor_shape, dtype=torch.float32, device=hml_context.device)
         inpainted_motion[:, :, :, :context_len] = hml_context
         inpainted_motion = inpainted_motion.to(self.mdm_device)
@@ -145,7 +145,7 @@ class CLoSDA2M(closd_task.CLoSDTask):
         # used for the text-to-motion task only!
         if hasattr(self, 'hml_prefix_from_data'):
             is_first_iter = self.progress_buf < self.planning_horizon_30fps
-            hml_context[is_first_iter] = self.hml_prefix_from_data[is_first_iter, :, :, -self.context_len_20fps:]
+            hml_context[is_first_iter] = self.hml_prefix_from_data[is_first_iter, :, :, -self.context_len_mdm:]
 
         if self.mdm.is_prefix_comp:
             aux_entries.update({'prefix': hml_context})
@@ -240,7 +240,7 @@ class CLoSDA2M(closd_task.CLoSDTask):
             print('=== sample mdm for [{}] envs took [{:.2f}] sec'.format(sample.shape[0], time.time() - start_time))
 
         sample_reshaped = sample.squeeze(2).permute(0, 2, 1)
-        sample_xyz = self.rep.hml_to_pose(sample_reshaped, recon_data, sim_at_hml_idx=model_kwargs['y']['prefix_len']-1)  # hml rep [bs, n_frames_20fps, 263] -> smpl xyz [bs, n_frames_30fps, 24, 3]
+        sample_xyz = self.rep.hml_to_pose(sample_reshaped, recon_data, sim_at_hml_idx=model_kwargs['y']['prefix_len']-1, src_fps=self.mdm_fps, trg_fps=self.isaac_fps)  # hml rep [bs, n_frames_mdm_fps, 263] -> smpl xyz [bs, n_frames_30fps, 24, 3]
 
         if self.cfg['env']['dip']['debug_hml']:
             print(f'in get_mdm_next_planning_horizon: prompts={model_kwargs["y"]["text"][:2]}')
@@ -251,7 +251,7 @@ class CLoSDA2M(closd_task.CLoSDTask):
                                is_prefix_comp=True, model_kwargs=model_kwargs,)
 
         # Extract the planning horizon
-        context_len_30fps = model_kwargs['y']['prefix_len'] * 30 // 20
+        context_len_30fps = int(model_kwargs['y']['prefix_len'] * self.isaac_fps / self.mdm_fps)
         planning_horizon = sample_xyz[:, context_len_30fps-1:context_len_30fps+self.planning_horizon_30fps]  # [x, -z, y]
 
         return planning_horizon[:, 0], planning_horizon[:, 1:]

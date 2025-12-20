@@ -83,8 +83,8 @@ class RepresentationHandler:
         self.time_prints = time_prints
 
 
-    def hml_to_pose(self, pose, recon_data, sim_at_hml_idx):
-        # hml rep [bs, n_frames_20fps, 263] -> smpl xyz [bs, n_frames_30fps, 24, 3]
+    def hml_to_pose(self, pose, recon_data, sim_at_hml_idx, src_fps=20, trg_fps=30):
+        # hml rep [bs, n_frames_mdm_fps, 263] -> smpl xyz [bs, n_frames_sim_fps, 24, 3]
         start_time = time.time()
         unnormed_pose = (pose * self.std + self.mean).float()
         hml_xyz = recover_from_ric(unnormed_pose, 22)
@@ -94,26 +94,28 @@ class RepresentationHandler:
         zeroed_hml_pose = self.align_to_recon_data(hml_xyz, hml_transform_at_sim) 
         aligned_hml_xyz = self.align_to_recon_data(zeroed_hml_pose, recon_data, is_inverse=True)
 
-        pose_20fps = self.smpl_to_sim(self.xyz_to_full_smpl(aligned_hml_xyz))
-        pose_30fps = self.fps_convert(pose_20fps, 20, 30, interp_mode='bicubic')
-        # assert (self.fps_convert(pose_30fps, 30, 20) - pose_20fps).abs().max() < 0.01  # TEST
+        pose_src_fps = self.smpl_to_sim(self.xyz_to_full_smpl(aligned_hml_xyz))
+        pose_trg_fps = self.fps_convert(pose_src_fps, src_fps, trg_fps, interp_mode='bicubic')
+        # assert (self.fps_convert(pose_trg_fps, trg_fps, src_fps) - pose_src_fps).abs().max() < 0.01  # TEST
         if self.time_prints:
             print('=== hml_to_pose for [{}] envs took [{:.2f}] sec'.format(pose.shape[0], time.time() - start_time))
 
-        return pose_30fps
+        return pose_trg_fps
 
 
-    def pose_to_hml(self, pose, aux_ponts=None, fix_ik_bug=False):
+    def pose_to_hml(self, pose, aux_ponts=None, fix_ik_bug=False, src_fps=30, trg_fps=20):
         # pose [bs, seqlen, 24, 3]
         # aux_ponts [bs, n_points, 3] points to be translated to hml egocentric space
         # print('aux_ponts original: \n', aux_ponts)
         start_time = time.time()
         
-        # add a dummy last frame to pose, because last frame is truncated during orig_pose_to_hml
-        next_frame = pose[:, [-1]] + (pose[:, [-1]] - pose[:, [-2]])
-        pose = torch.cat([pose, next_frame], dim=1)
+        orig_pose, aux_ponts_hml = self.pose_to_hml_xyz(pose, aux_ponts, src_fps=src_fps, trg_fps=trg_fps)
         
-        orig_pose, aux_ponts_hml = self.pose_to_hml_xyz(pose, aux_ponts)
+        # add a dummy last frame to pose, because last frame is truncated during orig_pose_to_hml
+        # Doing it here ensures the padding is in the target_fps domain.
+        next_frame = orig_pose[:, [-1]] + (orig_pose[:, [-1]] - orig_pose[:, [-2]])
+        orig_pose = torch.cat([orig_pose, next_frame], dim=1)
+
         hml_pose, recon_data = self.orig_pose_to_hml(orig_pose, fix_ik_bug=fix_ik_bug) # add back bs placeholder
 
         if aux_ponts is not None:
@@ -180,11 +182,11 @@ class RepresentationHandler:
 
         return points
     
-    def pose_to_hml_xyz(self, pose, aux_ponts=None):
+    def pose_to_hml_xyz(self, pose, aux_ponts=None, src_fps=30, trg_fps=20):
         # pose [bs, seqlen, 24, 3]
         # aux_ponts [bs, n_points, 3] points to be translated to hml egocentric space
-        pose_20fps = self.fps_convert(pose, 30, 20, interp_mode='bicubic')
-        xyz_pose, translated_aux_ponts = self.sim_to_xyz(pose_20fps, aux_ponts)
+        pose_trg_fps = self.fps_convert(pose, src_fps, trg_fps, interp_mode='bicubic')
+        xyz_pose, translated_aux_ponts = self.sim_to_xyz(pose_trg_fps, aux_ponts)
         smpl_pose, translated_aux_ponts = self.xyz_to_smpl(xyz_pose, translated_aux_ponts)
         orig_pose = self.smpl_to_orig_pose(smpl_pose)
         

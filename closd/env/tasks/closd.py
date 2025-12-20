@@ -119,25 +119,52 @@ class CLoSD(humanoid_im.HumanoidIm):
         self.mdm.to(self.mdm_device)
         self.mdm.eval()  # disable random masking
         
-        self.mean = torch.from_numpy(self.mdm_data.dataset.t2m_dataset.mean).cuda()
-        self.std = torch.from_numpy(self.mdm_data.dataset.t2m_dataset.std).cuda()
+        # Support both AISTPP dataset (has motion_mean/motion_std) and HumanML3D dataset (has t2m_dataset.mean/std)
+        if hasattr(self.mdm_data.dataset, 't2m_dataset'):
+            if hasattr(self.mdm_data.dataset.t2m_dataset, 'mean'):
+                self.mean = torch.from_numpy(self.mdm_data.dataset.t2m_dataset.mean).cuda()
+                self.std = torch.from_numpy(self.mdm_data.dataset.t2m_dataset.std).cuda()
+            else:
+                self.mean = torch.from_numpy(self.mdm_data.dataset.t2m_dataset.motion_mean).cuda()
+                self.std = torch.from_numpy(self.mdm_data.dataset.t2m_dataset.motion_std).cuda()
+        elif hasattr(self.mdm_data.dataset, 'motion_mean'):
+            # AISTPP dataset uses motion_mean/motion_std
+            self.mean = torch.from_numpy(self.mdm_data.dataset.motion_mean).cuda()
+            self.std = torch.from_numpy(self.mdm_data.dataset.motion_std).cuda()
+        else:
+            self.mean = torch.from_numpy(self.mdm_data.dataset.mean).cuda()
+            self.std = torch.from_numpy(self.mdm_data.dataset.std).cuda()
 
         self.real_mesh = False  # add trrain if false
 
         self.cur_state = torch.ones([self.num_envs], dtype=torch.int64).cuda() * STATES.NO_STATE  # Placeholder for state machine
 
         # TODO - GUY - CONSTS MOVE TO CONFIG
+        # TODO - GUY - CONSTS MOVE TO CONFIG
         # TODO - GUY - FIGURE OUT ROUNDING VS //
         assert self.mdm.is_prefix_comp
         print(f'Overwriting [context_len, pred_len] to [{self.fake_mdm_args.context_len}, {self.fake_mdm_args.pred_len}] according to the prefix completion MDM parameters.')
-        self.max_frame_20fps = self.fake_mdm_args.pred_len
-        self.max_frame_30fps = self.max_frame_20fps * 30 // 20
+        
+        # MDM FPS dynamic logic
+        self.mdm_fps = 20 # default
+        if hasattr(self.fake_mdm_args, 'dataset'):
+            if self.fake_mdm_args.dataset == 'kit':
+                self.mdm_fps = 12.5
+            elif self.fake_mdm_args.dataset == 'aistpp':
+                self.mdm_fps = 60
+        
+        # Isaac FPS dynamic logic
+        self.isaac_fps = int(1.0 / self.dt + 0.5)
+        print(f"Dynamic FPS detection: MDM_FPS={self.mdm_fps} (dataset={getattr(self.fake_mdm_args, 'dataset', 'unknown')}), Isaac_FPS={self.isaac_fps} (dt={self.dt})")
+        
+        self.max_frame_mdm = self.fake_mdm_args.pred_len
+        self.max_frame_30fps = int(self.max_frame_mdm * self.isaac_fps / self.mdm_fps)
 
-        self.context_len_20fps = self.fake_mdm_args.context_len
-        self.context_len_30fps = int(round(self.context_len_20fps * 30 / 20))  # we use int(round()) so fps conversion forth and back will be consistent
+        self.context_len_mdm = self.fake_mdm_args.context_len
+        self.context_len_30fps = int(round(self.context_len_mdm * self.isaac_fps / self.mdm_fps))  # we use int(round()) so fps conversion forth and back will be consistent
 
-        self.planning_horizon_20fps = min(self.cfg['env']['dip']['planning_horizon'], self.fake_mdm_args.pred_len)
-        self.planning_horizon_30fps = self.planning_horizon_20fps * 30 // 20
+        self.planning_horizon_mdm = min(self.cfg['env']['dip']['planning_horizon'], self.fake_mdm_args.pred_len)
+        self.planning_horizon_30fps = int(self.planning_horizon_mdm * self.isaac_fps / self.mdm_fps)
 
         self.pose_buffer = torch.empty([self.num_envs, self.context_len_30fps, 24, 3], dtype=torch.float32, device=self.device)
         self.planning_horizon = torch.empty([self.num_envs, self.planning_horizon_30fps, 24, 3], dtype=torch.float32, device=self.device)
@@ -146,7 +173,7 @@ class CLoSD(humanoid_im.HumanoidIm):
         # save episodes in hml format, to be used for evaluation
         self.init_save_hml_episodes()
 
-        self.mdm_tensor_shape = (self.cfg['env']['num_envs'], self.mdm.njoints, self.mdm.nfeats, self.max_frame_20fps)
+        self.mdm_tensor_shape = (self.cfg['env']['num_envs'], self.mdm.njoints, self.mdm.nfeats, self.max_frame_mdm)
 
         # init rep handler
         self.rep = RepresentationHandler(mean=self.mean,
@@ -186,8 +213,8 @@ class CLoSD(humanoid_im.HumanoidIm):
                 now = datetime.now()
                 timestamp = now.strftime("%y_%m_%d_%H_%M")
                 save_name_suffix = self.save_name_suffix if not self.save_name_suffix in ['',None] else timestamp
-                self.save_hml_episodes_dir = f'{model_path_no_ext}.CLoSD_cfg{self.mdm_cfg_param}_planh{self.planning_horizon_20fps}_crop{self.prefix_crop_size}_exp{self.cfg["exp_name"]}_epoc{self.cfg["epoch"]}_max{self.max_saved_hml_episodes}_{save_name_suffix}'
-            os.makedirs(self.save_hml_episodes_dir)
+                self.save_hml_episodes_dir = f'{model_path_no_ext}.CLoSD_cfg{self.mdm_cfg_param}_planh{self.planning_horizon_mdm}_crop{self.prefix_crop_size}_exp{self.cfg["exp_name"]}_epoc{self.cfg["epoch"]}_max{self.max_saved_hml_episodes}_{save_name_suffix}'
+            os.makedirs(self.save_hml_episodes_dir, exist_ok=True)
             print(f'Saving hml episodes to [{self.save_hml_episodes_dir}]')
             
             # save config data
@@ -197,7 +224,7 @@ class CLoSD(humanoid_im.HumanoidIm):
     
 
     def build_completion_input(self, context_switch_vec=None):
-        # input: hml_poses [n_envs, n_frames@20fps, 263]
+        # input: hml_poses [n_envs, n_frames@mdm_fps, 263]
         # context_switch_vec [n_envs] if not None - indicates which env will use prediction context insted of sim contest
         # output: 
         #   inpainted_motion [bs, 263, 1, max_frames] where hml_poses is the prefix and the rest is zeros
@@ -212,10 +239,10 @@ class CLoSD(humanoid_im.HumanoidIm):
             aux_points = self.calc_cur_target_multi_joint()  # [bs, n_points, 3]     
         
         # Real performed motions from the simulator, translated to HML format
-        sim_context, translated_aux_points, recon_data = self.rep.pose_to_hml(pose_context, aux_points, fix_ik_bug=True)  # [bs, n_frames@20fps, 263], [bs, n_points, 3]
+        sim_context, translated_aux_points, recon_data = self.rep.pose_to_hml(pose_context, aux_points, fix_ik_bug=True)  # [bs, n_frames@mdm_fps, 263], [bs, n_points, 3]
         
 
-        sim_context = sim_context.unsqueeze(2).permute(0, 3, 2, 1)  # [bs, 263, 1, n_frames@20fps]
+        sim_context = sim_context.unsqueeze(2).permute(0, 3, 2, 1)  # [bs, 263, 1, n_frames@mdm_fps]
 
         if context_switch_vec is not None:
             pred_context = self.cur_mdm_pred[..., -sim_context.shape[-1]:]
@@ -231,7 +258,7 @@ class CLoSD(humanoid_im.HumanoidIm):
             hml_context = pred_context
 
         context_len = hml_context.shape[-1]
-        assert context_len == self.context_len_20fps
+        assert context_len == self.context_len_mdm
         inpainted_motion = torch.zeros(self.mdm_tensor_shape, dtype=torch.float32, device=hml_context.device)
         inpainted_motion[:, :, :, :context_len] = hml_context
         inpainted_motion = inpainted_motion.to(self.mdm_device)
@@ -250,7 +277,7 @@ class CLoSD(humanoid_im.HumanoidIm):
         # used for the text-to-motion task only!
         if hasattr(self, 'hml_prefix_from_data'):
             is_first_iter = self.progress_buf < self.planning_horizon_30fps
-            hml_context[is_first_iter] = self.hml_prefix_from_data[is_first_iter, :, :, -self.context_len_20fps:]
+            hml_context[is_first_iter] = self.hml_prefix_from_data[is_first_iter, :, :, -self.context_len_mdm:]
 
         if self.mdm.is_prefix_comp:
             aux_entries.update({'prefix': hml_context})
@@ -325,7 +352,7 @@ class CLoSD(humanoid_im.HumanoidIm):
             print('=== sample mdm for [{}] envs took [{:.2f}] sec'.format(sample.shape[0], time.time() - start_time))
 
         sample_reshaped = sample.squeeze(2).permute(0, 2, 1)
-        sample_xyz = self.rep.hml_to_pose(sample_reshaped, recon_data, sim_at_hml_idx=model_kwargs['y']['prefix_len']-1)  # hml rep [bs, n_frames_20fps, 263] -> smpl xyz [bs, n_frames_30fps, 24, 3]
+        sample_xyz = self.rep.hml_to_pose(sample_reshaped, recon_data, sim_at_hml_idx=model_kwargs['y']['prefix_len']-1)  # hml rep [bs, n_frames_mdm_fps, 263] -> smpl xyz [bs, n_frames_30fps, 24, 3]
 
         if self.cfg['env']['dip']['debug_hml']:
             print(f'in get_mdm_next_planning_horizon: prompts={model_kwargs["y"]["text"][:2]}')
@@ -336,7 +363,7 @@ class CLoSD(humanoid_im.HumanoidIm):
                                is_prefix_comp=True, model_kwargs=model_kwargs,)
 
         # Extract the planning horizon
-        context_len_30fps = model_kwargs['y']['prefix_len'] * 30 // 20
+        context_len_30fps = int(model_kwargs['y']['prefix_len'] * self.isaac_fps / self.mdm_fps)
         planning_horizon = sample_xyz[:, context_len_30fps-1:context_len_30fps+self.planning_horizon_30fps]  # [x, -z, y]
 
         return planning_horizon[:, 0], planning_horizon[:, 1:]
@@ -370,7 +397,7 @@ class CLoSD(humanoid_im.HumanoidIm):
             json_resp.update({"j3d_prev": self.prev_real_frame})
 
         return json_resp
-    
+
     def _compute_observations(self, env_ids=None):
         # env_ids is used for resetting
         if env_ids is None:
@@ -424,10 +451,10 @@ class CLoSD(humanoid_im.HumanoidIm):
         if hasattr(self, 'hml_prefix_from_data'):
             # convert prefix to isaac format
             # cur_frame = self.rep.sim_pose_to_ref_pose(self._rigid_body_pos)
-            sim_at_hml_idx = (self.frame_idx % self.planning_horizon_30fps) * 20 // 30  # FIXME: check if we need a '-1' here
-            hml_from_pose, _, recon_data = self.rep.pose_to_hml(self.pose_buffer, fix_ik_bug=True) # compute rot/trans of simulator character
+            sim_at_hml_idx = int((self.frame_idx % self.planning_horizon_30fps) * self.mdm_fps / self.isaac_fps)
+            hml_from_pose, _, recon_data = self.rep.pose_to_hml(self.pose_buffer, fix_ik_bug=True, src_fps=self.isaac_fps, trg_fps=self.mdm_fps) # compute rot/trans of simulator character
 
-            planning_horizon = self.rep.hml_to_pose(self.hml_prefix_from_data.squeeze(2).permute(0, 2, 1), recon_data, sim_at_hml_idx=sim_at_hml_idx)  # hml rep [bs, n_frames_20fps, 263] -> smpl xyz [bs, n_frames_30fps, 24, 3]
+            planning_horizon = self.rep.hml_to_pose(self.hml_prefix_from_data.squeeze(2).permute(0, 2, 1), recon_data, sim_at_hml_idx=sim_at_hml_idx, src_fps=self.mdm_fps, trg_fps=self.isaac_fps)  # hml rep [bs, n_frames_mdm_fps, 263] -> smpl xyz [bs, n_frames_30fps, 24, 3]
 
             # place the prefix in the planning_horizon so PHC will start imitating it (until the next call to MDM)
             self.planning_horizon[env_ids] = planning_horizon[env_ids, -self.planning_horizon_30fps:]  # [n_envs, horizon_len, 24, 3]
@@ -454,8 +481,8 @@ class CLoSD(humanoid_im.HumanoidIm):
                 
         # convert to hml format
         # while fix_ik_bug=False imitates HumanML3D distribution, fix_ik_bug=True attains better quantitative scores, probably because it is closer to the real phisical distribution + it eases the "work" for MDM
-        hml_motions, _, _ = self.rep.pose_to_hml(self.all_episodes[:self.n_all_episodes], None, fix_ik_bug=True)  # [bs, max_episode_len@20fps, 263]
-        hml_motions = hml_motions.unsqueeze(2).permute(0, 3, 2, 1)  # [bs, 263, 1, max_episode_len@20fps]
+        hml_motions, _, _ = self.rep.pose_to_hml(self.all_episodes[:self.n_all_episodes], None, fix_ik_bug=True, src_fps=self.isaac_fps, trg_fps=self.mdm_fps)  # [bs, max_episode_len@mdm_fps, 263]
+        hml_motions = hml_motions.unsqueeze(2).permute(0, 3, 2, 1)  # [bs, 263, 1, max_episode_len@mdm_fps]
             
         data_to_save = {'motion': hml_motions.squeeze().permute(0, 2, 1),  # use the same format used for evaluation
                         'caption': self.all_episodes_prompts[:self.n_all_episodes], 
@@ -536,7 +563,7 @@ class CLoSD(humanoid_im.HumanoidIm):
             caption = prompts[env_i]
             motion = xyz[env_i] # .transpose(2, 0, 1)  # [:length]
             animation_save_path = out_path.replace('.mp4', f'_{env_i}.mp4')
-            gt_frames = np.arange(self.context_len_20fps) if is_prefix_comp else []
+            gt_frames = np.arange(self.context_len_mdm) if is_prefix_comp else []
             cond=None
             if model_kwargs is not None:
                 cond = {k: v[env_i] for k,v in model_kwargs['y'].items() if '_cond' in k}
@@ -545,9 +572,9 @@ class CLoSD(humanoid_im.HumanoidIm):
                     cond.update({'joint_names': model_kwargs['y']['target_joint_names'][env_i]})
                 if 'is_heading' in model_kwargs['y']:
                     cond.update({'is_heading': model_kwargs['y']['is_heading'][env_i]})
-            animations[0, env_i] = plot_3d_motion(animation_save_path, t2m_kinematic_chain, motion, dataset='humanml', title=caption, fps=20, gt_frames=gt_frames, cond=cond)
+            animations[0, env_i] = plot_3d_motion(animation_save_path, t2m_kinematic_chain, motion, dataset='humanml', title=caption, fps=self.mdm_fps, gt_frames=gt_frames, cond=cond)
 
-        save_multiple_samples(out_path, {'all': 'samples_{:02d}_to_{:02d}.mp4'}, animations, 20, xyz.shape[1], no_dir=True)
+        save_multiple_samples(out_path, {'all': 'samples_{:02d}_to_{:02d}.mp4'}, animations, self.mdm_fps, xyz.shape[1], no_dir=True)
 
         abs_path = os.path.abspath(out_path)
         print(f'[Done] Results are at [{abs_path}]')

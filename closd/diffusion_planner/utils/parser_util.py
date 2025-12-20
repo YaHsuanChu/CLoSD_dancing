@@ -253,9 +253,12 @@ def add_sampling_options(parser):
 
 def add_generate_options(parser):
     group = parser.add_argument_group('generate')
-    group.add_argument("--motion_length", default=6.0, type=float,
+    group.add_argument("--motion_length", default=None, type=float,
                        help="The length of the sampled motion [in seconds]. "
                             "Maximum is 9.8 for HumanML3D (text-to-motion), and 2.0 for HumanAct12 (action-to-motion)")
+    group.add_argument("--n_frames", default=None, type=int,
+                       help="Number of frames to generate. If specified, takes precedence over motion_length. "
+                            "Duration is calculated as n_frames / fps.")
     group.add_argument("--input_text", default='', type=str,
                        help="Path to a text file lists text prompts to be synthesized. If empty, will take text prompts from dataset.")
     group.add_argument("--action_file", default='', type=str,
