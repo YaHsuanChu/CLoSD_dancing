@@ -190,6 +190,7 @@ def main():
     all_gt_motions = []  # Ground truth for comparison
     all_lengths = []
     all_audio_embeds = []
+    all_audio_waveforms = []  # Raw audio waveforms for beat alignment
     
     n_batches = (args.num_samples + args.batch_size - 1) // args.batch_size
     data_iter = iter(data)
@@ -280,6 +281,24 @@ def main():
         if audio_embed_pred is not None:
             all_audio_embeds.append(audio_embed_pred.cpu().numpy())
         
+        # Collect raw audio waveforms for beat alignment
+        audio_meta_list = model_kwargs["y"].get("audio", None)
+        if audio_meta_list is not None:
+            batch_waveforms = []
+            for audio_meta in audio_meta_list:
+                if audio_meta is not None:
+                    wf = audio_meta.get("waveform", None)
+                    sr = audio_meta.get("sample_rate", None)
+                    if wf is not None:
+                        if torch.is_tensor(wf):
+                            wf = wf.detach().cpu().numpy()
+                        batch_waveforms.append({"waveform": wf, "sample_rate": int(sr) if sr else 44100})
+                    else:
+                        batch_waveforms.append(None)
+                else:
+                    batch_waveforms.append(None)
+            all_audio_waveforms.extend(batch_waveforms)
+        
         all_motions.append(sample_hml)
         all_gt_motions.append(gt_motion)
         all_lengths.append(lengths)
@@ -328,6 +347,10 @@ def main():
     
     if all_audio_embeds is not None:
         result_dict["audio_embed"] = all_audio_embeds
+    
+    # Save audio waveforms (trimmed to match num_samples)
+    if all_audio_waveforms:
+        result_dict["audio_waveforms"] = all_audio_waveforms[:args.num_samples]
     
     np.save(output_file, result_dict)
     print(f"\n[Done] Saved {args.num_samples} generated motions to [{output_file}]")

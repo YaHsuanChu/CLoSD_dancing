@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
+import pickle
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -77,23 +78,94 @@ def _is_joints_motion(motion: torch.Tensor) -> bool:
     return motion.dim() == 4 and motion.shape[1] in [21, 22] and motion.shape[2] == 3
 
 
-def _recover_joints_from_263(motion_tn_263: torch.Tensor, n_joints: int = 22, hml_type=None) -> torch.Tensor:
+def _recover_joints_from_263(
+    motion_tn_263: torch.Tensor,
+    n_joints: int = 22,
+    hml_type=None,
+    mean: torch.Tensor = None,
+    std: torch.Tensor = None,
+) -> torch.Tensor:
     """Recover joints from HumanML 263 features.
 
     Input: (B, T, 263) => output: (B, n_joints, 3, T)
+    
+    If mean/std are provided, denormalize the motion first.
     """
+    # Denormalize if mean/std provided
+    if mean is not None and std is not None:
+        # motion_tn_263: (B, T, 263)
+        motion_tn_263 = motion_tn_263 * std + mean
+    
     # recover_from_ric expects (B, T, 263) (float)
     joints = recover_from_ric(motion_tn_263, n_joints, hml_type)  # (B, T, n_joints, 3)
     joints = joints.permute(0, 2, 3, 1).contiguous()  # (B, n_joints, 3, T)
     return joints
 
 
-def _load_external_results(path: str) -> Tuple[np.ndarray, np.ndarray]:
+def _load_external_results(path: str, use_gt: bool = False) -> Tuple[np.ndarray, np.ndarray, Optional[List[Dict]]]:
+    """Load external results from .npy or .pkl file.
+    
+    Supports:
+    - .npy from generate_from_audio.py: keys 'motion', 'gt_motion', 'lengths'
+    - .pkl from run.py (CLoSD): keys 'motion', 'length'
+    
+    Args:
+        use_gt: If True, load gt_motion instead of motion (npy files only)
+    """
+    if path.endswith('.pkl'):
+        if use_gt:
+            print("[WARN] --eval_gt not supported for pkl files, using motion")
+        return _load_external_results_pkl(path)
+    else:
+        return _load_external_results_npy(path, use_gt=use_gt)
+
+
+def _load_external_results_pkl(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Load from CLoSD pkl format (run.py)."""
+    with open(path, 'rb') as f:
+        data = pickle.load(f)
+    motions = data["motion"]
+    # pkl uses 'length' (singular), not 'lengths'
+    lengths = data["length"]
+    # Convert to numpy if tensor
+    if hasattr(motions, 'numpy'):
+        motions = motions.numpy()
+    if hasattr(lengths, 'numpy'):
+        lengths = lengths.numpy()
+    return motions, lengths, None  # pkl files don't have paired audio
+
+
+def _load_external_results_npy(path: str, use_gt: bool = False) -> Tuple[np.ndarray, np.ndarray, Optional[List[Dict]]]:
+    """Load from generate_from_audio.py npy format.
+    
+    Args:
+        path: Path to npy file
+        use_gt: If True, load gt_motion instead of motion (for baseline comparison)
+    
+    Returns:
+        motions, lengths, audio_waveforms (list of {waveform, sample_rate} dicts or None)
+    """
     arr = np.load(path, allow_pickle=True)
     data = arr.item() if hasattr(arr, "item") else arr
-    motions = data["motion"]
+    
+    if use_gt:
+        if "gt_motion" in data:
+            motions = data["gt_motion"]
+            print("[INFO] Loading ground truth motions (gt_motion)")
+        else:
+            print("[WARN] gt_motion not found in file, using motion instead")
+            motions = data["motion"]
+    else:
+        motions = data["motion"]
+    
     lengths = data["lengths"]
-    return motions, lengths
+    
+    # Load paired audio waveforms if available
+    audio_waveforms = data.get("audio_waveforms", None)
+    if audio_waveforms is not None:
+        print(f"[INFO] Loaded {len(audio_waveforms)} paired audio waveforms from npy file")
+    
+    return motions, lengths, audio_waveforms
 
 
 def _get_gt_batch_with_audio(
@@ -166,37 +238,78 @@ def _extract_beats_from_waveform(waveform: np.ndarray, sr: int) -> np.ndarray:
         return np.array(keep, dtype=np.float32) / float(sr)
 
 
-def _motion_contact_onsets(joints: np.ndarray, fps: float = 20.0) -> np.ndarray:
-    """Detect foot-contact onsets from joints.
+def _extract_kinematic_beats(joints: np.ndarray, fps: float = 60.0, smooth: bool = False) -> np.ndarray:
+    """Extract kinematic beats as local minima of body velocity (AIST++ standard).
 
-    joints: (T, 22, 3) in meters (?) y-up.
-    Returns onset times in seconds.
+    joints: (T, 22, 3) in meters.
+    smooth: If True, apply Savitzky-Golay filter to reduce jitter.
+    Returns beat times in seconds.
+    
+    Principle: When dancers 'hit' a beat, they typically pause/freeze momentarily,
+    causing body velocity to drop to a local minimum.
     """
-    # HumanML convention in metrics.py assumes foot joints 10/11
-    foot_idx = [10, 11]
-    y = joints[:, foot_idx, 1]  # (T,2)
-    vxz = np.linalg.norm(joints[1:, foot_idx][:, :, [0, 2]] - joints[:-1, foot_idx][:, :, [0, 2]], axis=-1) * fps
+    from scipy.signal import argrelextrema, savgol_filter
+    
+    # Compute velocity: diff of joint positions
+    # velocity shape: (T-1, 22, 3)
+    velocity = np.diff(joints, axis=0) * fps  # scale by fps to get m/s
+    
+    # Compute speed per joint: (T-1, 22)
+    speed_per_joint = np.linalg.norm(velocity, axis=2)
+    
+    # Average across all joints to get kinetic speed curve: (T-1,)
+    kinetic_speed = speed_per_joint.mean(axis=1)
+    
+    # Optional: Apply smoothing to reduce high-frequency jitter
+    if smooth and len(kinetic_speed) >= 15:
+        window_length = min(15, len(kinetic_speed) // 2 * 2 + 1)
+        if window_length >= 5:
+            kinetic_speed = savgol_filter(kinetic_speed, window_length, polyorder=2)
+    
+    # Find local minima (valley points in speed curve)
+    # order controls minimum distance between peaks
+    order = 6 if smooth else 2
+    local_min_idx = argrelextrema(kinetic_speed, np.less, order=order)[0]
+    
+    # Convert frame indices to time (seconds)
+    beat_times = local_min_idx.astype(np.float32) / fps
+    
+    return beat_times
 
-    # contact when low and slow
-    height_thr = 0.05
-    vel_thr = 0.2
-    contact = (y[:-1] < height_thr) & (y[1:] < height_thr) & (vxz < vel_thr)
-    contact_any = contact[:, 0] | contact[:, 1]  # (T-1,)
 
-    # onset: rising edge
-    onset = np.where((~contact_any[:-1]) & (contact_any[1:]))[0] + 1
-    onset_t = onset.astype(np.float32) / fps
-    return onset_t
-
-
-def _beat_align_score(beat_times: np.ndarray, onset_times: np.ndarray, sigma: float = 0.08) -> float:
-    """Gaussian kernel alignment between beat times and motion onset times."""
-    if beat_times.size == 0 or onset_times.size == 0:
+def _beat_align_score(music_beats: np.ndarray, dance_beats: np.ndarray, sigma: float = 0.08) -> float:
+    """Calculate Beat Alignment Score (BAS) - AIST++ standard.
+    
+    Measures the average distance from each dance beat to the nearest music beat.
+    This is Precision: how accurately does each dance movement land on a beat?
+    (Dancers can skip beats, but when they move, they should be on beat.)
+    
+    Args:
+        music_beats: Times of music beats (seconds)
+        dance_beats: Times of kinematic beats / velocity minima (seconds)
+        sigma: Gaussian tolerance parameter (default 0.08s = 80ms)
+    
+    Returns:
+        Score in [0, 1], higher is better alignment
+    """
+    if dance_beats.size == 0:
+        # No dance movements detected
         return 0.0
-    # for each beat, distance to nearest onset
-    d = np.abs(beat_times[:, None] - onset_times[None, :])
-    dmin = d.min(axis=1)
-    score = np.exp(-(dmin**2) / (2 * sigma**2)).mean()
+    if music_beats.size == 0:
+        # No music beats detected
+        return 0.0
+    
+    # Matrix: [Num_Dance_Beats, Num_Music_Beats]  
+    # For each dance beat, compute distance to all music beats
+    d = np.abs(dance_beats[:, None] - music_beats[None, :])
+    
+    # Find the nearest music beat for each dance beat
+    # axis=1 means: along Music Beats dimension, keep Dance Beats dimension
+    min_dist = d.min(axis=1)
+    
+    # Gaussian scoring: closer to 0 distance = higher score
+    score = np.exp(-(min_dist**2) / (2 * sigma**2)).mean()
+    
     return float(score)
 
 
@@ -220,31 +333,60 @@ def main():
     parser.add_argument("--context_len", type=int, default=20)
     parser.add_argument("--pred_len", type=int, default=40)
     parser.add_argument("--fixed_len", type=int, default=60)
-    parser.add_argument("--fps", type=float, default=20.0)
+    parser.add_argument("--fps", type=float, default=60.0, help="Motion FPS (AIST++ uses 60fps)")
     parser.add_argument("--diversity_times", type=int, default=300)
     parser.add_argument("--beat_sigma", type=float, default=0.08)
+    parser.add_argument("--smooth_kinematic", action="store_true", 
+                        help="Apply smoothing filter to kinematic speed before beat detection")
+    parser.add_argument("--eval_gt", action="store_true",
+                        help="Evaluate ground truth motions instead of generated motions (for baseline)")
     args = parser.parse_args()
 
     dist_util.setup_dist(args.device)
     device = dist_util.dev()
 
     # external motions
-    motions_np, lengths_np = _load_external_results(args.external_results_file)
+    motions_np, lengths_np, paired_audio = _load_external_results(args.external_results_file, use_gt=args.eval_gt)
     motions = torch.tensor(motions_np).float().to(device)
     lengths = torch.tensor(lengths_np).long().to(device)
 
     # If prefix mode used during generation, lengths may already include prefix.
     # For our AIST++ fixed-length setting, we assume all lengths are fixed_len.
     num_samples = motions.shape[0]
-
-    # build GT batch (same sample count, but not index-aligned; distribution-aligned)
-    gt_motion, gt_lengths, gt_audio_meta = _get_gt_batch_with_audio(
-        device=device,
-        num_samples=num_samples,
-        fixed_len=args.fixed_len,
-        pred_len=args.pred_len,
-        seed=args.seed,
-    )
+    
+    # Detect actual motion length from the loaded data
+    # motions shape: (B, T, 263) or (B, 263, 1, T)
+    if motions.dim() == 3:
+        actual_motion_len = motions.shape[1]
+    else:
+        actual_motion_len = motions.shape[-1]
+    
+    # Determine audio source
+    if paired_audio is not None:
+        # Use paired audio from the npy file (correct for beat alignment)
+        print(f"[INFO] Using {len(paired_audio)} paired audio waveforms for beat alignment")
+        gt_audio_meta = paired_audio
+        # Still load GT motion for FID calculation
+        audio_fixed_len = actual_motion_len if actual_motion_len > args.fixed_len else args.fixed_len
+        gt_motion, gt_lengths, _ = _get_gt_batch_with_audio(
+            device=device,
+            num_samples=num_samples,
+            fixed_len=audio_fixed_len,
+            pred_len=audio_fixed_len,
+            seed=args.seed,
+        )
+    else:
+        # Fallback: load audio from dataloader (may not be paired)
+        print(f"[WARN] No paired audio in npy file, using random audio from dataloader")
+        audio_fixed_len = actual_motion_len if actual_motion_len > args.fixed_len else args.fixed_len
+        print(f"[INFO] Motion length: {actual_motion_len} frames, loading audio with fixed_len={audio_fixed_len}")
+        gt_motion, gt_lengths, gt_audio_meta = _get_gt_batch_with_audio(
+            device=device,
+            num_samples=num_samples,
+            fixed_len=audio_fixed_len,
+            pred_len=audio_fixed_len,
+            seed=args.seed,
+        )
 
     fid = None
     diversity = None
@@ -272,11 +414,27 @@ def main():
         diversity = float(calculate_diversity(gen_emb, div_times)) if div_times > 1 else 0.0
 
     # --- joints-based physics metrics ---
+    # Load mean/std for denormalization (AIST++ uses raw motion stats)
+    dataset_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dataset")
+    mean_path = os.path.join(dataset_dir, "aistpp_motion_mean_raw.npy")
+    std_path = os.path.join(dataset_dir, "aistpp_motion_std_raw.npy")
+    
+    motion_mean = None
+    motion_std = None
+    if os.path.exists(mean_path) and os.path.exists(std_path):
+        motion_mean = torch.tensor(np.load(mean_path)).float().to(device)
+        motion_std = torch.tensor(np.load(std_path)).float().to(device)
+        print(f"[INFO] Loaded motion mean/std from {dataset_dir}")
+    else:
+        print(f"[WARN] Could not find mean/std files at {dataset_dir}, joints may be incorrect scale")
+    
     if _is_joints_motion(motions):
         gen_joints = motions.detach().cpu()
     else:
         gen_263_tn = _to_263_tn(motions)
-        gen_joints = _recover_joints_from_263(gen_263_tn, n_joints=22).detach().cpu()  # (B,22,3,T)
+        gen_joints = _recover_joints_from_263(
+            gen_263_tn, n_joints=22, mean=motion_mean, std=motion_std
+        ).detach().cpu()  # (B,22,3,T)
 
     lengths_cpu = lengths.detach().cpu().numpy().tolist()
 
@@ -296,7 +454,7 @@ def main():
 
     # --- beat align ---
     beat_scores = []
-    # use GT audio meta as the conditioning reference (fixed_len audio)
+    n_with_audio = 0
     for i in range(min(num_samples, len(gt_audio_meta))):
         meta = gt_audio_meta[i]
         if meta is None:
@@ -305,13 +463,16 @@ def main():
         sr = meta.get("sample_rate", None)
         if wf is None or sr is None:
             continue
+        n_with_audio += 1
         if torch.is_tensor(wf):
             wf = wf.detach().cpu().numpy()
-        beat_t = _extract_beats_from_waveform(wf, int(sr))
+        music_beats = _extract_beats_from_waveform(wf, int(sr))
 
         joints_i = gen_joints[i].permute(2, 0, 1).numpy()  # (T,22,3)
-        onset_t = _motion_contact_onsets(joints_i, fps=args.fps)
-        beat_scores.append(_beat_align_score(beat_t, onset_t, sigma=args.beat_sigma))
+        kinematic_beats = _extract_kinematic_beats(joints_i, fps=args.fps, smooth=args.smooth_kinematic)
+        
+        # Calculate alignment: how well do kinematic beats align with music beats?
+        beat_scores.append(_beat_align_score(music_beats, kinematic_beats, sigma=args.beat_sigma))
 
     beat_align = float(np.mean(beat_scores)) if len(beat_scores) > 0 else 0.0
 
