@@ -31,13 +31,13 @@ python closd/diffusion_planner/eval/eval_aistpp_external.py \
 
 | Metric | Description | Better |
 |--------|-------------|--------|
-| **FID** | Fr?chet Inception Distance between generated and GT motion distributions | Lower ¡õ |
-| **Diversity** | Variance of motion features | Higher ¡ô |
-| **BeatAlign** | How well kinematic beats align with music beats (0-1) | Higher ¡ô |
-| **SkatingRatio** | Ratio of frames with foot skating artifact | Lower ¡õ |
-| **FootSliding** | Total foot sliding distance (mm) | Lower ¡õ |
-| **Penetration** | Foot penetration into ground (mm) | Lower ¡õ |
-| **Floating** | Distance feet float above ground (mm) | Lower ¡õ |
+| **FID** | Fr?chet Inception Distance between generated and GT motion distributions | Lower Â¡Ãµ |
+| **Diversity** | Variance of motion features | Higher Â¡Ã´ |
+| **BeatAlign** | How well kinematic beats align with music beats (0-1) | Higher Â¡Ã´ |
+| **SkatingRatio** | Ratio of frames with foot skating artifact | Lower Â¡Ãµ |
+| **FootSliding** | Total foot sliding distance (mm) | Lower Â¡Ãµ |
+| **Penetration** | Foot penetration into ground (mm) | Lower Â¡Ãµ |
+| **Floating** | Distance feet float above ground (mm) | Lower Â¡Ãµ |
 
 ## Beat Alignment (BAS)
 
