@@ -184,6 +184,7 @@ def _get_gt_batch_with_audio(
       audio_meta_list: list of dicts (may include waveform/sample_rate/path/...)
     """
     fixseed(seed)
+    print("[DEBUG] _get_gt_batch_with_audio: calling get_dataset_loader...")
 
     loader = get_dataset_loader(
         name="aistpp",
@@ -196,7 +197,9 @@ def _get_gt_batch_with_audio(
         device=device,
         drop_last=True,
     )
+    print("[DEBUG] _get_gt_batch_with_audio: loader created, getting first batch...")
     motion, cond = next(iter(loader))
+    print("[DEBUG] _get_gt_batch_with_audio: got batch!")
     y = cond["y"]
     lengths = y["lengths"].to(device)
     audio_meta = y.get("audio", None)
@@ -205,20 +208,29 @@ def _get_gt_batch_with_audio(
     return motion.to(device), lengths, audio_meta
 
 
-def _extract_beats_from_waveform(waveform: np.ndarray, sr: int) -> np.ndarray:
-    """Return beat times in seconds.
+def _extract_beats_from_waveform(waveform: np.ndarray, sr: int) -> Tuple[np.ndarray, bool]:
+    """Return (beat_times_in_seconds, used_librosa).
 
     Uses librosa if available; otherwise falls back to a simple onset envelope peak picking.
+    Returns a tuple: (beat_times, True if librosa was used else False)
     """
     try:
         import librosa  # type: ignore
-
-        tempo, beats = librosa.beat.beat_track(y=waveform.astype(np.float32), sr=sr, units="frames")
-        beat_times = librosa.frames_to_time(beats, sr=sr)
-        return beat_times
-    except Exception:
+        
+        # Ensure waveform is 1D and float32
+        if waveform.ndim > 1:
+            waveform = waveform.flatten()
+        waveform = waveform.astype(np.float32)
+        
+        # librosa.beat.beat_track returns (tempo, beat_frames)
+        tempo, beat_frames = librosa.beat.beat_track(y=waveform, sr=sr)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        return beat_times.astype(np.float32), True
+    except Exception as e:
         # minimal fallback: detect peaks on energy envelope
         x = waveform.astype(np.float32)
+        if x.ndim > 1:
+            x = x.flatten()
         x = x / (np.max(np.abs(x)) + 1e-8)
         win = int(0.05 * sr)
         if win <= 1:
@@ -235,7 +247,7 @@ def _extract_beats_from_waveform(waveform: np.ndarray, sr: int) -> np.ndarray:
             if i - last >= refractory:
                 keep.append(i)
                 last = i
-        return np.array(keep, dtype=np.float32) / float(sr)
+        return np.array(keep, dtype=np.float32) / float(sr), False
 
 
 def _extract_kinematic_beats(joints: np.ndarray, fps: float = 60.0, smooth: bool = False) -> np.ndarray:
@@ -313,39 +325,16 @@ def _beat_align_score(music_beats: np.ndarray, dance_beats: np.ndarray, sigma: f
     return float(score)
 
 
-def _compute_embeddings(eval_wrapper: EvaluatorMDMWrapper, motion_263_b1t: torch.Tensor, lengths: torch.Tensor, batch_size: int = 16) -> np.ndarray:
+def _compute_embeddings(eval_wrapper: EvaluatorMDMWrapper, motion_263_b1t: torch.Tensor, lengths: torch.Tensor) -> np.ndarray:
     """Compute motion embeddings using evaluator wrapper.
 
     motion_263_b1t: (B, 263, 1, T) or convertible
-    batch_size: Process in batches to avoid OOM for long sequences
     Returns: (B, D)
     """
     motion_tn = _to_263_tn(motion_263_b1t)  # (B,T,263)
-    
-    # Process in batches to avoid OOM for long sequences
-    n_samples = motion_tn.shape[0]
-    print(f"[DEBUG] _compute_embeddings: n_samples={n_samples}, motion_tn.shape={motion_tn.shape}, lengths.shape={lengths.shape}")
-    print(f"[DEBUG] lengths min/max: {lengths.min().item()}/{lengths.max().item()}")
-    
-    if n_samples <= batch_size:
-        # Small enough to process at once
-        print(f"[DEBUG] Processing all at once (n_samples <= batch_size)")
+    with torch.no_grad():
         emb = eval_wrapper.get_motion_embeddings(motion_tn, lengths)
-        return emb.detach().cpu().numpy()
-    
-    # Process in batches
-    all_emb = []
-    for i in range(0, n_samples, batch_size):
-        end_i = min(i + batch_size, n_samples)
-        batch_motion = motion_tn[i:end_i]
-        batch_lengths = lengths[i:end_i]
-        print(f"[DEBUG] Batch {i//batch_size}: batch_motion.shape={batch_motion.shape}, batch_lengths={batch_lengths[:5]}...")
-        with torch.no_grad():
-            batch_emb = eval_wrapper.get_motion_embeddings(batch_motion, batch_lengths)
-        all_emb.append(batch_emb.detach().cpu().numpy())
-        torch.cuda.empty_cache()  # Clear cache between batches
-    
-    return np.concatenate(all_emb, axis=0)
+    return emb.detach().cpu().numpy()
 
 
 def main():
@@ -363,6 +352,10 @@ def main():
                         help="Apply smoothing filter to kinematic speed before beat detection")
     parser.add_argument("--eval_gt", action="store_true",
                         help="Evaluate ground truth motions instead of generated motions (for baseline)")
+    parser.add_argument("--skip_fid", action="store_true",
+                        help="Skip FID/Diversity calculation (faster, skips GT dataloader loading)")
+    parser.add_argument("--beat_samples", type=int, default=100,
+                        help="Number of samples for BeatAlign calculation (default: 100, use -1 for all)")
     args = parser.parse_args()
 
     dist_util.setup_dist(args.device)
@@ -389,32 +382,40 @@ def main():
         print(f"[WARN] lengths max ({lengths.max().item()}) > actual_motion_len ({actual_motion_len}), clamping")
         lengths = lengths.clamp(max=actual_motion_len)
     
-    # Determine audio source
+    # Determine audio source and whether to load GT data
+    gt_motion = None
+    gt_lengths = None
+    
     if paired_audio is not None:
         # Use paired audio from the npy file (correct for beat alignment)
         print(f"[INFO] Using {len(paired_audio)} paired audio waveforms for beat alignment")
         gt_audio_meta = paired_audio
-        # Still load GT motion for FID calculation
-        audio_fixed_len = actual_motion_len if actual_motion_len > args.fixed_len else args.fixed_len
-        gt_motion, gt_lengths, _ = _get_gt_batch_with_audio(
-            device=device,
-            num_samples=num_samples,
-            fixed_len=audio_fixed_len,
-            pred_len=audio_fixed_len,
-            seed=args.seed,
-        )
+        # Only load GT motion for FID calculation if not skipping
+        if not args.skip_fid:
+            audio_fixed_len = actual_motion_len if actual_motion_len > args.fixed_len else args.fixed_len
+            gt_motion, gt_lengths, _ = _get_gt_batch_with_audio(
+                device=device,
+                num_samples=num_samples,
+                fixed_len=audio_fixed_len,
+                pred_len=audio_fixed_len,
+                seed=args.seed,
+            )
     else:
         # Fallback: load audio from dataloader (may not be paired)
         print(f"[WARN] No paired audio in npy file, using random audio from dataloader")
         audio_fixed_len = actual_motion_len if actual_motion_len > args.fixed_len else args.fixed_len
-        print(f"[INFO] Motion length: {actual_motion_len} frames, loading audio with fixed_len={audio_fixed_len}")
+        # Limit samples for faster audio loading
+        audio_samples = args.beat_samples if args.beat_samples > 0 else num_samples
+        audio_samples = min(audio_samples, num_samples)
+        print(f"[INFO] Loading {audio_samples} audio samples for BeatAlign (fixed_len={audio_fixed_len})")
         gt_motion, gt_lengths, gt_audio_meta = _get_gt_batch_with_audio(
             device=device,
-            num_samples=num_samples,
+            num_samples=audio_samples,
             fixed_len=audio_fixed_len,
             pred_len=audio_fixed_len,
             seed=args.seed,
         )
+        print("[DEBUG] Dataloader done!")
 
     fid = None
     diversity = None
@@ -426,16 +427,19 @@ def main():
             "[WARN] External results motion looks like joints (B,22,3,T). "
             "Skipping FID/Diversity (HumanML 263-d evaluator expects (B,T,263))."
         )
+    elif args.skip_fid:
+        print("[INFO] Skipping FID/Diversity calculation (--skip_fid)")
     else:
         eval_wrapper = EvaluatorMDMWrapper("humanml", device)
 
         # --- FID / Diversity ---
         gen_emb = _compute_embeddings(eval_wrapper, motions, lengths)
-        gt_emb = _compute_embeddings(eval_wrapper, gt_motion, gt_lengths)
-
-        gt_mu, gt_cov = calculate_activation_statistics(gt_emb)
-        gen_mu, gen_cov = calculate_activation_statistics(gen_emb)
-        fid = float(calculate_frechet_distance(gt_mu, gt_cov, gen_mu, gen_cov))
+        
+        if gt_motion is not None:
+            gt_emb = _compute_embeddings(eval_wrapper, gt_motion, gt_lengths)
+            gt_mu, gt_cov = calculate_activation_statistics(gt_emb)
+            gen_mu, gen_cov = calculate_activation_statistics(gen_emb)
+            fid = float(calculate_frechet_distance(gt_mu, gt_cov, gen_mu, gen_cov))
 
         # diversity is computed only on generated set
         div_times = min(args.diversity_times, gen_emb.shape[0] - 1)
@@ -483,6 +487,7 @@ def main():
     # --- beat align ---
     beat_scores = []
     n_with_audio = 0
+    n_librosa_fallback = 0
     for i in range(min(num_samples, len(gt_audio_meta))):
         meta = gt_audio_meta[i]
         if meta is None:
@@ -494,7 +499,9 @@ def main():
         n_with_audio += 1
         if torch.is_tensor(wf):
             wf = wf.detach().cpu().numpy()
-        music_beats = _extract_beats_from_waveform(wf, int(sr))
+        music_beats, used_librosa = _extract_beats_from_waveform(wf, int(sr))
+        if not used_librosa:
+            n_librosa_fallback += 1
 
         joints_i = gen_joints[i].permute(2, 0, 1).numpy()  # (T,22,3)
         kinematic_beats = _extract_kinematic_beats(joints_i, fps=args.fps, smooth=args.smooth_kinematic)
@@ -502,6 +509,9 @@ def main():
         # Calculate alignment: how well do kinematic beats align with music beats?
         beat_scores.append(_beat_align_score(music_beats, kinematic_beats, sigma=args.beat_sigma))
 
+    if n_librosa_fallback > 0:
+        print(f"[WARN] librosa not used for {n_librosa_fallback}/{n_with_audio} samples (fallback peak detection used)")
+    
     beat_align = float(np.mean(beat_scores)) if len(beat_scores) > 0 else 0.0
 
     print("=== AIST++ external eval ===")
