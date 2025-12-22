@@ -313,16 +313,39 @@ def _beat_align_score(music_beats: np.ndarray, dance_beats: np.ndarray, sigma: f
     return float(score)
 
 
-def _compute_embeddings(eval_wrapper: EvaluatorMDMWrapper, motion_263_b1t: torch.Tensor, lengths: torch.Tensor) -> np.ndarray:
+def _compute_embeddings(eval_wrapper: EvaluatorMDMWrapper, motion_263_b1t: torch.Tensor, lengths: torch.Tensor, batch_size: int = 16) -> np.ndarray:
     """Compute motion embeddings using evaluator wrapper.
 
     motion_263_b1t: (B, 263, 1, T) or convertible
+    batch_size: Process in batches to avoid OOM for long sequences
     Returns: (B, D)
     """
     motion_tn = _to_263_tn(motion_263_b1t)  # (B,T,263)
-    # evaluator expects something it can do motions[..., :-4] on; (B,T,263) works.
-    emb = eval_wrapper.get_motion_embeddings(motion_tn, lengths)
-    return emb.detach().cpu().numpy()
+    
+    # Process in batches to avoid OOM for long sequences
+    n_samples = motion_tn.shape[0]
+    print(f"[DEBUG] _compute_embeddings: n_samples={n_samples}, motion_tn.shape={motion_tn.shape}, lengths.shape={lengths.shape}")
+    print(f"[DEBUG] lengths min/max: {lengths.min().item()}/{lengths.max().item()}")
+    
+    if n_samples <= batch_size:
+        # Small enough to process at once
+        print(f"[DEBUG] Processing all at once (n_samples <= batch_size)")
+        emb = eval_wrapper.get_motion_embeddings(motion_tn, lengths)
+        return emb.detach().cpu().numpy()
+    
+    # Process in batches
+    all_emb = []
+    for i in range(0, n_samples, batch_size):
+        end_i = min(i + batch_size, n_samples)
+        batch_motion = motion_tn[i:end_i]
+        batch_lengths = lengths[i:end_i]
+        print(f"[DEBUG] Batch {i//batch_size}: batch_motion.shape={batch_motion.shape}, batch_lengths={batch_lengths[:5]}...")
+        with torch.no_grad():
+            batch_emb = eval_wrapper.get_motion_embeddings(batch_motion, batch_lengths)
+        all_emb.append(batch_emb.detach().cpu().numpy())
+        torch.cuda.empty_cache()  # Clear cache between batches
+    
+    return np.concatenate(all_emb, axis=0)
 
 
 def main():
@@ -360,6 +383,11 @@ def main():
         actual_motion_len = motions.shape[1]
     else:
         actual_motion_len = motions.shape[-1]
+    
+    # Clamp lengths to actual motion length (PKL files may have original lengths > motion frames)
+    if lengths.max() > actual_motion_len:
+        print(f"[WARN] lengths max ({lengths.max().item()}) > actual_motion_len ({actual_motion_len}), clamping")
+        lengths = lengths.clamp(max=actual_motion_len)
     
     # Determine audio source
     if paired_audio is not None:
