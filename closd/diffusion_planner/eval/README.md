@@ -136,21 +136,23 @@ The Beat Alignment Score is calculated using three metrics to provide a comprehe
 
 
 ### 表格 A: 完整實驗數據總表 (Master Table)
-
-這是包含所有指標的總覽表
-
+這是包含所有指標的總覽表。
 *   **單位說明：** Sliding, Penetration, Floating 單位皆為 **mm**。
 *   **粗體 (Bold)：** 代表該指標表現最佳（接近 GT 或數值最優）。
-*   *(註): CLoSD 的 BeatAlign 因音頻隨機配對，數值無效故不列入。*
+*   *(註): CLoSD 的 BeatAlign 因音頻隨機配對，數值無效故標示為 -。*
 
-| Model Config | Context | **FID** (↓) | **Diversity** | **BAS (F1)** (↑) | **BAS (Recall)** | **Skating** (↓) | **Foot Sliding** (mm, ↓) | **Penetration** (mm, ↓) | **Floating** (mm, ↓) |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Ground Truth** | - | **0.05** | **5.34** | 0.325 | 0.529 | **0.0083** | 0.05 | 0.00 | 59.2 |
-| **CLoSD (Phys)** | - | **5.07** | 3.58 | - | - | 0.0176 | **0.00** | **0.00** | **23.9** |
-| **Concat (Ours)** | ng20 | 16.17 | 4.62 | 0.366 | 0.763 | 0.0152 | 0.90 | 1.87 | 249.8 |
-| **Concat (Ours)** | ng40 | 18.28 | 4.35 | **0.368** | **0.790** | 0.0486 | 2.39 | 1.61 | 242.2 |
-| **Concat (Ours)** | **ng80** | **11.75** | 3.63 | 0.357 | 0.689 | **0.0087** | **0.25** | **0.15** | 169.4 |
-| **X-Attention** | ng40 | 27.84 | 3.66 | 0.355 | 0.644 | 0.0000* | 0.00* | 0.00* | 103.4 |
+| Model Config | Context | **FID** (↓) | **Diversity** | **BAS (F1)** (↑) | **BAS (Recall)** | **BAS (Precision)** | **Skating** (↓) | **Sliding** (mm) | **Penetration** (mm) | **Floating** (mm) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Ground Truth** | - | **0.05** | **5.34** | 0.325 | 0.529 | **0.246** | **0.0083** | 0.05 | 0.00 | 59.2 |
+| **Concat ng40 + CLoSD** | - | **5.07** | 3.58 | - | - | - | 0.0176 | **0.00** | **0.00** | **23.9** |
+| **Concat (Ours)** | ng20 | 16.17 | 4.62 | 0.366 | 0.763 | 0.245 | 0.0152 | 0.90 | 1.87 | 249.8 |
+| **Concat (Ours)** | ng40 | 18.28 | 4.35 | **0.368** | **0.790** | 0.244 | 0.0486 | 2.39 | 1.61 | 242.2 |
+| **Concat (Ours)** | **ng80** | **11.75** | 3.63 | 0.357 | 0.689 | **0.246** | **0.0087** | **0.25** | **0.15** | 169.4 |
+| **X-Attention** | ng40 | 27.84 | 3.66 | 0.355 | 0.644 | 0.250 | 0.0000* | 0.00* | 0.00* | 103.4 |
+
+> **註解：**
+> 1.  **CLoSD Beat Scores:** 因測試時音頻隨機配對，數值無效故不列出。
+> 2.  **X-Attention Physics:** Skating/Sliding 為 0 是因為 Floating 過高 (103mm) 且原地轉圈，導致算法無法檢測到有效觸地，屬於數值假象 (Artifact)。
 
 ---
 
@@ -160,7 +162,7 @@ The Beat Alignment Score is calculated using three metrics to provide a comprehe
 | Method | **FID** (Realism) ↓ | **Skating Ratio** ↓ | **Floating** (mm) ↓ | **Penetration** (mm) ↓ |
 | :--- | :---: | :---: | :---: | :---: |
 | **Ground Truth** | 0.05 | 0.0083 | 59.2 | 0.00 |
-| **CLoSD (Post-process)** | **5.07** | 0.0176 | **23.9** | **0.00** |
+| **Concat ng40 + CLoSD** | **5.07** | 0.0176 | **23.9** | **0.00** |
 | **Concat-ng20** | 16.17 | 0.0152 | 249.8 | 1.87 |
 | **Concat-ng40** | 18.28 | 0.0486 | 242.2 | 1.61 |
 | **Concat-ng80** | **11.75** | **0.0087** | 169.4 | 0.15 |
@@ -233,11 +235,12 @@ The Beat Alignment Score is calculated using three metrics to provide a comprehe
     *   **Recall:** 寬鬆要求音樂節拍附近有動作即可，有利於生成更密集的運動。
 *   **您的數據中的體現：**
     *   **GT 的 Precision (0.246) vs. Recall (0.529):** GT 的 Precision 很高，說明舞者移動非常準確。但 Recall 低於 Precision，表明舞者並非每個拍子都有強烈動作（例如，有些拍子是延音，有些是過渡）。
-    *   **Concat-ng40 的 Recall (0.790) vs. Precision (0.244):** ng40 的 Recall 非常高，Precision 與 GT 相當。這意味著生成的動作「密集的覆蓋」了所有音樂節拍，但 Precision 並未因此顯著下降（因為它的動作是持續的，雖然密集，但仍算對準了節拍）。
+    *   **ng40/ng20 的過度反應：** 這兩個模型的 Recall 高達 0.76~0.79，推高了整體的 F1 Score (0.368)。雖然數值好看，但這暗示模型生成的動作密度過高，缺乏真實舞蹈的強弱對比。
     *   **Concat-ng80 的 Recall (0.689) vs. Precision (0.246):** ng80 的 Recall 比 ng40 低，但 Precision 與 GT 相當，且 F1 Score (0.357) 仍然很高。這代表 ng80 的動作密度**開始向 GT 靠攏**，不再是無腦的填滿節拍。
     *   **X-Attention 的 Recall (0.644) vs. Precision (0.250):** Recall 數值雖然不高，但 Precision 意外的較高。然而，結合其極差的 FID (**27.84**) 和视觉效果，這是一個典型的 **"Metric Hacking"** 案例。模型可能透過產生微弱的、但足夠覆蓋節拍的「噪音」或「原地抖動」，來提升 Recall，而無視了真實的動作質量。
 *   **結論：**
-    *   **ng80 的節奏感：** 儘管 ng40 的 Recall 最高，但 ng80 的 **F1 Score (0.357)** 是最高的，且其 Recall (0.689) 和 Precision (0.246) 更接近 GT。這表明 ng80 在節奏的「綜合表現」上最佳，既對準了音樂，又具有更自然的動作密度。
+    *   **ng80 的節奏感最自然：** 雖然 ng40 擁有最高的 F1 Score (0.368)，但这主要歸功於其過高的 Recall (0.790)，暗示了動作過度密集。相比之下，ng80 的 Recall (0.689) 回落至更接近 GT (0.529) 的水平，且 Precision (0.246) 與 GT 完全一致。這表明 ng80 不再機械式地填滿每一個拍子，而是學會了像真實舞者一樣的節奏呼吸感（留白），在『質』與『量』之間取得了更自然的平衡。
+    *   **X-Attention 的 Metric Hacking：** X-Attention 雖然 F1 有 0.355，但結合極差的 FID，證明其是透過原地轉圈產生的密集噪音來「刷」Recall 分數，而非產生有效舞蹈。
     *   **CLoSD 的 BeatAlign 無效：** 由於音頻未配對，CLoSD 的 BeatAlign 分數（Precision 0.236, Recall 0.659）僅為隨機猜測，無參考價值。
 
 ### D. 物理合理性分析 (Physics Metrics)
