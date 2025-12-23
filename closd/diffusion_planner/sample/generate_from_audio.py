@@ -61,6 +61,18 @@ def parse_args():
                         choices=["none", "concat"],
                         help="Audio concatenation mode (default: none)")
     
+    # Model architecture arguments (for xattn models)
+    parser.add_argument("--arch", type=str, default="trans_enc",
+                        choices=["trans_enc", "trans_dec", "gru"],
+                        help="Architecture type (default: trans_enc)")
+    parser.add_argument("--text_encoder_type", type=str, default="clip",
+                        choices=["clip", "bert", "none"],
+                        help="Text encoder type (default: clip)")
+    parser.add_argument("--per_frame_audio_xatten", action="store_true",
+                        help="Use per-frame audio tokens as cross-attention memory")
+    parser.add_argument("--text_uncond_all", action="store_true",
+                        help="Set text_uncond=True for all batches (useful for pure audio conditioning)")
+    
     return parser.parse_args()
 
 
