@@ -145,9 +145,10 @@ The Beat Alignment Score is calculated using three metrics to provide a comprehe
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Ground Truth** | - | **0.05** | **5.34** | 0.325 | 0.529 | **0.246** | **0.0083** | 0.05 | 0.00 | 59.2 |
 | **Concat ng40 + CLoSD** | - | **5.07** | 3.58 | - | - | - | 0.0176 | **0.00** | **0.00** | **23.9** |
+| **Concat ng80 + CLoSD** | - | 11.94 | 3.13 | - | - | - | 0.0507 | **0.00** | **0.00** | 35.9 |
 | **Concat (Ours)** | ng20 | 16.17 | 4.62 | 0.366 | 0.763 | 0.245 | 0.0152 | 0.90 | 1.87 | 249.8 |
 | **Concat (Ours)** | ng40 | 18.28 | 4.35 | **0.368** | **0.790** | 0.244 | 0.0486 | 2.39 | 1.61 | 242.2 |
-| **Concat (Ours)** | **ng80** | **11.75** | 3.63 | 0.357 | 0.689 | **0.246** | **0.0087** | **0.25** | **0.15** | 169.4 |
+| **Concat (Ours)** | **ng80** | 11.75 | 3.63 | 0.357 | 0.689 | **0.246** | **0.0087** | 0.25 | 0.15 | 169.4 |
 | **X-Attention** | ng40 | 27.84 | 3.66 | 0.355 | 0.644 | 0.250 | 0.0000* | 0.00* | 0.00* | 103.4 |
 
 > **註解：**
@@ -159,13 +160,14 @@ The Beat Alignment Score is calculated using three metrics to provide a comprehe
 ### 表格 B: 生成質量與物理真實性 (Quality & Physics Focus)
 *適合用來強調 CLoSD 的修復能力以及 ng80 的長序列穩定性。*
 
-| Method | **FID** (Realism) ↓ | **Skating Ratio** ↓ | **Floating** (mm) ↓ | **Penetration** (mm) ↓ |
-| :--- | :---: | :---: | :---: | :---: |
-| **Ground Truth** | 0.05 | 0.0083 | 59.2 | 0.00 |
-| **Concat ng40 + CLoSD** | **5.07** | 0.0176 | **23.9** | **0.00** |
-| **Concat-ng20** | 16.17 | 0.0152 | 249.8 | 1.87 |
-| **Concat-ng40** | 18.28 | 0.0486 | 242.2 | 1.61 |
-| **Concat-ng80** | **11.75** | **0.0087** | 169.4 | 0.15 |
+| Method | **FID** (Realism) ↓ | **Skating Ratio** ↓ | **Floating** (mm) ↓ | **Penetration** (mm) ↓ | **Foot Sliding** (mm) ↓ |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Ground Truth** | 0.05 | 0.0083 | 59.2 | 0.00 | 0.05 |
+| **Concat ng40 + CLoSD** | **5.07** | 0.0176 | **23.9** | **0.00** | **0.00** |
+| **Concat ng80 + CLoSD** | 11.94 | 0.0507 | 35.9 | **0.00** | **0.00** |
+| **Concat-ng20** | 16.17 | 0.0152 | 249.8 | 1.87 | 0.90 |
+| **Concat-ng40** | 18.28 | 0.0486 | 242.2 | 1.61 | 2.39 |
+| **Concat-ng80** | 11.75 | **0.0087** | 169.4 | 0.15 | 0.25 |
 
 ---
 
@@ -480,3 +482,33 @@ Diversity: 3.6255
   FootSliding(mm):    0.2495
   Penetration(mm):    0.1466
   Floating(mm):       169.4469
+
+---
+python closd/diffusion_planner/eval/eval_aistpp_external.py --external_results_file /share3/saves/boson/image/CLoSD_dancing/output/run80/CLoSD80.pkl
+[WARN] lengths max (2877) > actual_motion_len (200), clamping
+[WARN] No paired audio in npy file, using random audio from dataloader
+[INFO] Loading 1000 audio samples for BeatAlign (fixed_len=200)
+[DEBUG] _get_gt_batch_with_audio: calling get_dataset_loader...
+Fetching 52 files: 100%|████████████████████████████████████████████████████████████████| 52/52 [00:00<00:00, 17216.91it/s]
+Data dependencies are cached at [/share2/huggingface/hub/models--guytevet--CLoSD/snapshots/de7106b947b6f70700b5320d1cd61fef4a9ebc9b]
+[DEBUG] _get_gt_batch_with_audio: loader created, getting first batch...
+[DEBUG] _get_gt_batch_with_audio: got batch!
+[DEBUG] Dataloader done!
+Fetching 52 files: 100%|████████████████████████████████████████████████████████████████| 52/52 [00:00<00:00, 27365.60it/s]
+Data dependencies are cached at [/share2/huggingface/hub/models--guytevet--CLoSD/snapshots/de7106b947b6f70700b5320d1cd61fef4a9ebc9b]
+Loading Evaluation Model Wrapper (Epoch 11) Completed!!
+[INFO] Loaded motion mean/std from closd/diffusion_planner/dataset
+=== AIST++ external eval ===
+external_results_file: /share3/saves/boson/image/CLoSD_dancing/output/run80/CLoSD80.pkl
+num_samples: 1000
+FID: 11.9404
+Diversity: 3.1309
+--- Beat Alignment (sigma=0.05, n=1000) ---
+  Precision: 0.2373 ± 0.0738
+  Recall:    0.6670 ± 0.1298
+  F1 Score:  0.3447 ± 0.0883
+--- Physics ---
+  SkatingRatio(mean): 0.0507
+  FootSliding(mm):    0.0010
+  Penetration(mm):    0.0023
+  Floating(mm):       35.9210
